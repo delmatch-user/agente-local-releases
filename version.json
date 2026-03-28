@@ -1,5 +1,5 @@
 {
-  "version": "3.4",
+  "version": "3.5",
   "url": "https://github.com/delmatch-user/agente-local-releases/releases/download/v3.4/AgenteLocal.exe",
-  "notes": "Versao inicial"
+  "notes": "v3.5: Suporte a WebSocket gateway (ws-agente), campo CNPJ/CPF na licença, melhorias na impressão"
 }
