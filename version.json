@@ -1,5 +1,5 @@
 {
   "version": "3.6",
   "url": "https://github.com/delmatch-user/agente-local-releases/releases/download/v3.6/AgenteLocal.exe",
-  "notes": "Suporte Bematech, relatorio de erros automatico, dashboard de status"
+  "notes": "Historico de jobs, reimpressao, contador diario, crash fix, startup automatico"
 }
