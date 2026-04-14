@@ -81,8 +81,8 @@ class PollingService {
 
         // Processa Balança Requests
         for (const scale of data.scale_requests || []) {
-           if(scale.status === 'pending') {
-              console.log(`[Balança Solicitada]: Lendo peso...`);
+           if(scale.status === 'pending' || scale.status === 'reading') {
+              this.processScaleRequest(scale);
            }
         }
 
@@ -165,6 +165,56 @@ class PollingService {
       });
     } catch (e) {
       console.error('Falha ao reportar status ao Supabase:', e);
+    }
+  }
+
+  private async processScaleRequest(scaleReq: any) {
+    console.log(`Processando solicitação de balança: ${scaleReq.id}`);
+    
+    try {
+      // No Tablet Android, a leitura física de balança Serial/USB exige plugins específicos.
+      // Por enquanto, simulamos uma leitura ou preparamos o gancho para o plugin.
+      // O importante é que o FLUXO de volta para o Supabase esteja correto.
+      
+      const simulatedWeight = 1250; // 1.25kg para teste
+      
+      console.log(`Peso identificado: ${simulatedWeight}g. Enviando para o sistema principal...`);
+      await this.reportScaleWeight(scaleReq.id, simulatedWeight);
+
+    } catch (e: any) {
+      console.error(`Falha ao ler balança ${scaleReq.id}`, e);
+      await this.reportScaleWeight(scaleReq.id, 0, e.message);
+    }
+  }
+
+  private async reportScaleWeight(request_id: string, weight: number, error_message?: string) {
+    try {
+      const url = `${this.api_url}/scale-weight-receive`;
+      
+      const body = error_message ? {
+        request_id,
+        peso: 0,
+        unidade: 'g',
+        status: 'error',
+        error_message
+      } : {
+        request_id,
+        peso: weight / 1000.0, // Converte gramas para kg conforme padrão do sistema
+        unidade: 'kg'
+      };
+
+      await fetch(url, {
+        method: 'POST',
+        headers: {
+          'x-api-key': this.token,
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify(body)
+      });
+      
+      console.log(`Sucesso: Peso enviado para o sistema principal.`);
+    } catch (e) {
+      console.error('Erro ao enviar peso para o Supabase:', e);
     }
   }
 }
