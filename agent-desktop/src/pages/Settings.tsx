@@ -1,5 +1,6 @@
-import { useState, useEffect } from 'react'
 import { invoke } from '@tauri-apps/api/tauri'
+import { checkUpdate, installUpdate } from '@tauri-apps/api/updater'
+import { message, ask } from '@tauri-apps/api/dialog'
 
 interface Config {
   agent_token: string | null
@@ -26,6 +27,7 @@ export default function Settings({ config, onConfigUpdate }: SettingsProps) {
   const [networkIp, setNetworkIp] = useState('')
   const [testing, setTesting] = useState(false)
   const [testResult, setTestResult] = useState<string | null>(null)
+  const [checkingUpdate, setCheckingUpdate] = useState(false)
 
   useEffect(() => {
     loadPrinters()
@@ -71,6 +73,36 @@ export default function Settings({ config, onConfigUpdate }: SettingsProps) {
       })
     } catch (e) {
       console.error('Failed to open drawer:', e)
+    }
+  }
+
+  const handleCheckUpdates = async () => {
+    setCheckingUpdate(true)
+    try {
+      const { shouldUpdate, manifest } = await checkUpdate()
+      if (shouldUpdate) {
+        const yes = await ask(
+          `Nova versão disponível: ${manifest?.version}\n\n${manifest?.body}\n\nDeseja atualizar agora?`,
+          { title: 'Atualização Disponível', type: 'info' }
+        )
+        if (yes) {
+          await installUpdate()
+          // O Tauri reinicia o app automaticamente após a instalação
+        }
+      } else {
+        await message('Você já está utilizando a versão mais recente.', { 
+          title: 'Agente Atualizado',
+          type: 'info' 
+        })
+      }
+    } catch (e) {
+      console.error('Falha ao buscar atualizações:', e)
+      await message(`Erro ao buscar atualizações: ${e}`, { 
+        title: 'Falha na Atualização',
+        type: 'error' 
+      })
+    } finally {
+      setCheckingUpdate(false)
     }
   }
 
@@ -170,9 +202,18 @@ export default function Settings({ config, onConfigUpdate }: SettingsProps) {
         </button>
       </div>
 
-      {/* Version */}
-      <div className="text-center text-xs text-slate-400">
-        MiaCardapio Agent v1.0.0
+      {/* Version & Update */}
+      <div className="pt-4 border-t border-slate-100 flex flex-col items-center gap-3">
+        <button
+          onClick={handleCheckUpdates}
+          disabled={checkingUpdate}
+          className="text-xs font-bold text-primary-600 hover:text-primary-700 disabled:opacity-50"
+        >
+          {checkingUpdate ? 'Buscando...' : '🔍 Buscar Atualizações'}
+        </button>
+        <div className="text-xs text-slate-400">
+          MiaCardapio Agent v1.0.0
+        </div>
       </div>
     </div>
   )
