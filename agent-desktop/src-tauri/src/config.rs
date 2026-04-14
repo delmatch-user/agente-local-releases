@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct AppConfig {
     pub agent_token: Option<String>,
+    pub supabase_key: Option<String>,
     pub scale_token: Option<String>,
     pub api_url: String,
     pub polling_interval_secs: u64,
@@ -18,8 +19,9 @@ impl AppConfig {
     pub fn new() -> Self {
         Self {
             agent_token: None,
+            supabase_key: None,
             scale_token: None,
-            api_url: "https://exohczhkqhwttnbvttqe.supabase.co/functions/v1".to_string(),
+            api_url: "https://szlyzyflalerxuyxfxzh.supabase.co/functions/v1".to_string(),
             polling_interval_secs: 5,
             printers: Vec::new(),
             scale: None,

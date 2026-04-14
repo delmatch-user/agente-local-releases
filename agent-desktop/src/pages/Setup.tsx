@@ -1,11 +1,12 @@
 import { useState } from 'react'
 
 interface SetupProps {
-  onTokenSet: (token: string) => void
+  onTokenSet: (token: string, supabaseKey?: string) => void
 }
 
 export default function Setup({ onTokenSet }: SetupProps) {
   const [token, setToken] = useState('')
+  const [supabaseKey, setSupabaseKey] = useState('')
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
 
@@ -20,7 +21,7 @@ export default function Setup({ onTokenSet }: SetupProps) {
     setError(null)
     
     try {
-      await onTokenSet(token.trim())
+      await onTokenSet(token.trim(), supabaseKey.trim())
     } catch (err) {
       setError('Falha ao configurar token. Verifique e tente novamente.')
     } finally {
@@ -40,14 +41,28 @@ export default function Setup({ onTokenSet }: SetupProps) {
 
       <form onSubmit={handleSubmit} className="space-y-4">
         <div>
+          <label htmlFor="supabaseKey" className="block text-sm font-medium text-slate-700 mb-1">
+            Chave Pública Anon (apikey)
+          </label>
+          <input
+            id="supabaseKey"
+            type="password"
+            value={supabaseKey}
+            onChange={(e) => setSupabaseKey(e.target.value)}
+            placeholder="Ache no painel do Supabase (Anon Key)..."
+            className="w-full px-3 py-2 border border-slate-300 rounded-lg focus:ring-2 focus:ring-primary-500 focus:border-primary-500"
+          />
+        </div>
+
+        <div>
           <label htmlFor="token" className="block text-sm font-medium text-slate-700 mb-1">
-            Token do Agente
+            Token do Agente Oculto (x-api-key)
           </label>
           <textarea
             id="token"
             value={token}
             onChange={(e) => setToken(e.target.value)}
-            placeholder="Cole o token aqui..."
+            placeholder="Token gerado no painel do restaurante..."
             className="w-full px-3 py-2 border border-slate-300 rounded-lg focus:ring-2 focus:ring-primary-500 focus:border-primary-500 resize-none h-24"
           />
         </div>

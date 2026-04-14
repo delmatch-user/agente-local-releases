@@ -41,9 +41,13 @@ async fn save_config(
 async fn set_agent_token(
     state: tauri::State<'_, AppState>,
     token: String,
+    supabase_key: Option<String>,
 ) -> Result<(), String> {
     let mut config = state.config.lock().await;
     config.agent_token = Some(token);
+    if let Some(key) = supabase_key {
+        config.supabase_key = Some(key);
+    }
     state.db.save_config(&config).map_err(|e| e.to_string())?;
     Ok(())
 }
@@ -85,12 +89,13 @@ async fn start_polling(
     }
     
     let token = config.agent_token.clone().unwrap();
+    let supabase_key = config.supabase_key.clone().unwrap_or_default();
     let api_url = config.api_url.clone();
     let db = state.db.clone();
     
     drop(config);
     
-    let polling = PollingService::new(token, api_url, db, app_handle);
+    let polling = PollingService::new(token, supabase_key, api_url, db, app_handle);
     
     let mut polling_guard = state.polling.lock().await;
     *polling_guard = Some(polling);

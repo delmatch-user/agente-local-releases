@@ -54,6 +54,7 @@ pub struct PollConfig {
 
 pub struct PollingService {
     token: String,
+    supabase_key: String,
     api_url: String,
     db: Arc<Database>,
     app_handle: tauri::AppHandle,
@@ -63,12 +64,14 @@ pub struct PollingService {
 impl PollingService {
     pub fn new(
         token: String,
+        supabase_key: String,
         api_url: String,
         db: Arc<Database>,
         app_handle: tauri::AppHandle,
     ) -> Self {
         Self {
             token,
+            supabase_key,
             api_url,
             db,
             app_handle,
@@ -85,6 +88,7 @@ impl PollingService {
         drop(running);
         
         let token = self.token.clone();
+        let supabase_key = self.supabase_key.clone();
         let api_url = self.api_url.clone();
         let db = self.db.clone();
         let app_handle = self.app_handle.clone();
@@ -101,23 +105,23 @@ impl PollingService {
                     }
                 }
                 
-                match poll_once(&client, &api_url, &token).await {
+                match poll_once(&client, &api_url, &token, &supabase_key).await {
                     Ok(response) => {
                         // Process print jobs
                         for job in response.print_jobs {
-                            process_print_job(&job, &db, &app_handle, &client, &api_url, &token).await;
+                            process_print_job(&job, &db, &app_handle, &client, &api_url, &token, &supabase_key).await;
                         }
                         
                         // Process scale requests
                         for scale_req in &response.scale_requests {
                             if scale_req.status == "pending" || scale_req.status == "reading" {
-                                process_scale_request(scale_req, &app_handle, &client, &api_url, &token, &response.config).await;
+                                process_scale_request(scale_req, &app_handle, &client, &api_url, &token, &supabase_key, &response.config).await;
                             }
                         }
                         
                         // Process commands
                         for cmd in response.commands {
-                            process_command(&cmd, &app_handle, &client, &api_url, &token).await;
+                            process_command(&cmd, &app_handle, &client, &api_url, &token, &supabase_key).await;
                         }
                         
                         // Emit status update
@@ -130,7 +134,7 @@ impl PollingService {
                 }
                 
                 // Sync pending offline jobs
-                sync_pending(&db, &client, &api_url, &token).await;
+                sync_pending(&db, &client, &api_url, &token, &supabase_key).await;
                 
                 tokio::time::sleep(Duration::from_secs(5)).await;
             }
@@ -147,13 +151,20 @@ async fn poll_once(
     client: &reqwest::Client,
     api_url: &str,
     token: &str,
+    supabase_key: &str,
 ) -> Result<PollResponse, reqwest::Error> {
     let url = format!("{}/agent-unified-poll", api_url);
     
-    let response = client
-        .get(&url)
+    let mut request = client.get(&url)
         .header("x-api-key", token)
-        .header("Content-Type", "application/json")
+        .header("Content-Type", "application/json");
+
+    if !supabase_key.is_empty() {
+        request = request.header("apikey", supabase_key)
+                        .header("Authorization", format!("Bearer {}", supabase_key));
+    }
+
+    let response = request
         .timeout(Duration::from_secs(30))
         .send()
         .await?
@@ -170,6 +181,7 @@ async fn process_print_job(
     client: &reqwest::Client,
     api_url: &str,
     token: &str,
+    supabase_key: &str,
 ) {
     log::info!("Processing print job: {}", job.id);
     
@@ -178,7 +190,7 @@ async fn process_print_job(
         Ok(c) => c,
         Err(e) => {
             log::error!("Failed to parse job content: {}", e);
-            report_job_status(client, api_url, token, &job.id, "failed", Some(&e.to_string())).await;
+            report_job_status(client, api_url, token, supabase_key, &job.id, "failed", Some(&e.to_string())).await;
             return;
         }
     };
@@ -204,12 +216,12 @@ async fn process_print_job(
     match result {
         Ok(_) => {
             log::info!("Job {} printed successfully", job.id);
-            report_job_status(client, api_url, token, &job.id, "printed", None).await;
+            report_job_status(client, api_url, token, supabase_key, &job.id, "printed", None).await;
             let _ = app_handle.emit_all("job_printed", &job.id);
         }
         Err(e) => {
             log::error!("Job {} failed: {}", job.id, e);
-            report_job_status(client, api_url, token, &job.id, "failed", Some(&e.to_string())).await;
+            report_job_status(client, api_url, token, supabase_key, &job.id, "failed", Some(&e.to_string())).await;
             let _ = app_handle.emit_all("job_failed", (&job.id, e.to_string()));
         }
     }
@@ -232,6 +244,7 @@ async fn process_command(
     client: &reqwest::Client,
     api_url: &str,
     token: &str,
+    supabase_key: &str,
 ) {
     log::info!("Processing command: {} ({})", cmd.id, cmd.command_type);
     
@@ -287,11 +300,11 @@ async fn process_command(
                         "weight": weight,
                         "command_id": cmd.id,
                     }));
-                    report_scale_weight(client, api_url, token, &cmd.id, weight, None).await;
+                    report_scale_weight(client, api_url, token, supabase_key, &cmd.id, weight, None).await;
                 }
                 Err(e) => {
                     log::error!("Failed to read scale: {}", e);
-                    report_scale_weight(client, api_url, token, &cmd.id, 0.0, Some(&e.to_string())).await;
+                    report_scale_weight(client, api_url, token, supabase_key, &cmd.id, 0.0, Some(&e.to_string())).await;
                 }
             }
         }
@@ -308,6 +321,7 @@ async fn report_job_status(
     client: &reqwest::Client,
     api_url: &str,
     token: &str,
+    supabase_key: &str,
     job_id: &str,
     status: &str,
     error: Option<&str>,
@@ -320,13 +334,17 @@ async fn report_job_status(
         "error_message": error,
     });
     
-    let _ = client
-        .post(&url)
+    let mut request = client.post(&url)
         .header("x-api-key", token)
         .header("Content-Type", "application/json")
-        .json(&body)
-        .send()
-        .await;
+        .json(&body);
+
+    if !supabase_key.is_empty() {
+        request = request.header("apikey", supabase_key)
+                        .header("Authorization", format!("Bearer {}", supabase_key));
+    }
+    
+    let _ = request.send().await;
 }
 
 async fn sync_pending(
@@ -334,10 +352,11 @@ async fn sync_pending(
     client: &reqwest::Client,
     api_url: &str,
     token: &str,
+    supabase_key: &str,
 ) {
     if let Ok(pending) = db.get_pending_sync() {
         for (id, job_id, status, error) in pending {
-            report_job_status(client, api_url, token, &job_id, &status, error.as_deref()).await;
+            report_job_status(client, api_url, token, supabase_key, &job_id, &status, error.as_deref()).await;
             let _ = db.remove_pending_sync(id);
         }
     }
@@ -349,6 +368,7 @@ async fn process_scale_request(
     client: &reqwest::Client,
     api_url: &str,
     token: &str,
+    supabase_key: &str,
     config: &PollConfig,
 ) {
     log::info!("Processing scale request: {}", scale_req.id);
@@ -395,7 +415,7 @@ async fn process_scale_request(
                 "request_id": scale_req.id,
                 "stable": true,
             }));
-            report_scale_weight(client, api_url, token, &scale_req.id, weight, None).await;
+            report_scale_weight(client, api_url, token, supabase_key, &scale_req.id, weight, None).await;
         }
         Err(e) => {
             log::error!("Scale read failed for {}: {}", scale_req.id, e);
@@ -403,7 +423,7 @@ async fn process_scale_request(
                 "request_id": scale_req.id,
                 "error": e.to_string(),
             }));
-            report_scale_weight(client, api_url, token, &scale_req.id, 0.0, Some(&e.to_string())).await;
+            report_scale_weight(client, api_url, token, supabase_key, &scale_req.id, 0.0, Some(&e.to_string())).await;
         }
     }
 }
@@ -412,6 +432,7 @@ async fn report_scale_weight(
     client: &reqwest::Client,
     api_url: &str,
     token: &str,
+    supabase_key: &str,
     request_id: &str,
     weight: f64,
     error: Option<&str>,
@@ -435,11 +456,15 @@ async fn report_scale_weight(
         })
     };
 
-    let _ = client
-        .post(&url)
+    let mut request = client.post(&url)
         .header("x-api-key", token)
         .header("Content-Type", "application/json")
-        .json(&body)
-        .send()
-        .await;
+        .json(&body);
+
+    if !supabase_key.is_empty() {
+        request = request.header("apikey", supabase_key)
+                        .header("Authorization", format!("Bearer {}", supabase_key));
+    }
+
+    let _ = request.send().await;
 }
