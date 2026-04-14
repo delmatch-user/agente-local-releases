@@ -25,9 +25,6 @@
       "path": {
         "all": true
       },
-      "updater": {
-        "all": true
-      }
     },
     "bundle": {
       "active": true,

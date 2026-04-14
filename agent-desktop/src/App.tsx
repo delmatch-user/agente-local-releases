@@ -61,8 +61,8 @@ function App() {
     }
   }
 
-  const handlePrinterTokenSet = async (token: string) => {
-    await invoke('set_agent_token', { token })
+  const handlePrinterTokenSet = async (token: string, supabaseKey?: string) => {
+    await invoke('set_agent_token', { token, supabaseKey: supabaseKey || null })
     await invoke('start_polling')
     await loadConfig()
     setPrinterPage('status')
