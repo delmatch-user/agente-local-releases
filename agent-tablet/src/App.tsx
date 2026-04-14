@@ -7,7 +7,7 @@ type ScalePage = 'setup' | 'status'
 
 interface Config {
   agent_token: string | null
-  scale_token: string | null
+  supabase_key: string | null
   api_url: string
   polling_interval_secs: number
   auto_start: boolean
@@ -19,8 +19,8 @@ const LocalStorageAPI = {
     if (raw) return JSON.parse(raw)
     return {
       agent_token: null,
-      scale_token: null,
-      api_url: 'https://v1.miacardapio.com/functions/v1',
+      supabase_key: null,
+      api_url: 'https://szlyzyflalerxuyxfxzh.supabase.co/functions/v1', // URL padrão do projeto atual
       polling_interval_secs: 5,
       auto_start: true
     }
@@ -58,7 +58,7 @@ function App() {
 
   useEffect(() => {
     if (config?.agent_token) {
-      agentPollingService.setConfig(config.api_url, config.agent_token, printersList)
+      agentPollingService.setConfig(config.api_url, config.agent_token, printersList, config.supabase_key || '')
       agentPollingService.start(
         (time) => {
           setIsOnline(true)
@@ -84,9 +84,12 @@ function App() {
     }
   }
 
-  const handlePrinterTokenSet = async (token: string, apiUrlParam?: string) => {
+  const handlePrinterTokenSet = async (token: string, apiUrlParam?: string, supabaseKey?: string) => {
     if(!config) return;
-    const newCfg = { ...config, agent_token: token, api_url: apiUrlParam || config.api_url }
+    const cleanToken = token.trim();
+    const cleanApiUrl = (apiUrlParam || config.api_url).trim();
+    const cleanSupabaseKey = (supabaseKey || '').trim();
+    const newCfg = { ...config, agent_token: cleanToken, api_url: cleanApiUrl, supabase_key: cleanSupabaseKey }
     await LocalStorageAPI.saveConfig(newCfg)
     await loadConfig()
   }
@@ -171,7 +174,11 @@ function App() {
                    onSubmit={(e) => {
                      e.preventDefault()
                      const f = new FormData(e.currentTarget)
-                     handlePrinterTokenSet(f.get('token') as string, f.get('api') as string)
+                     handlePrinterTokenSet(
+                       f.get('token') as string, 
+                       f.get('api') as string,
+                       f.get('supabase_key') as string
+                     )
                    }}
                  >
                    <div className="flex flex-col gap-1.5">
@@ -185,15 +192,27 @@ function App() {
                        className="w-full border-2 border-slate-200 rounded-xl px-4 py-3 text-sm font-medium focus:ring-4 focus:ring-primary-100 focus:border-primary-500 outline-none transition-all"
                      />
                    </div>
+
+                   <div className="flex flex-col gap-1.5">
+                     <label className="text-xs font-bold text-slate-500 uppercase tracking-wide">Chave Pública Anon (apikey)</label>
+                     <input 
+                       name="supabase_key"
+                       type="password"
+                       required
+                       defaultValue={config?.supabase_key || ''}
+                       placeholder="Ache no painel do Supabase (Anon Key)"
+                       className="w-full border-2 border-slate-200 rounded-xl px-4 py-3 text-sm font-medium focus:ring-4 focus:ring-primary-100 focus:border-primary-500 outline-none transition-all"
+                     />
+                   </div>
                    
                    <div className="flex flex-col gap-1.5">
-                     <label className="text-xs font-bold text-slate-500 uppercase tracking-wide">Token do Agente Oculto</label>
+                     <label className="text-xs font-bold text-slate-500 uppercase tracking-wide">Token do Agente Oculto (x-api-key)</label>
                      <input 
                        name="token"
                        type="password"
                        required
                        autoComplete="off"
-                       placeholder="Cole o token do balcão..."
+                       placeholder="Token gerado no painel do restaurante..."
                        className="w-full border-2 border-slate-200 rounded-xl px-4 py-3 text-sm font-medium focus:ring-4 focus:ring-primary-100 focus:border-primary-500 outline-none transition-all"
                      />
                    </div>

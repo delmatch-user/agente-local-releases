@@ -34,13 +34,15 @@ class PollingService {
   private intervalId: any = null;
   private api_url: string = '';
   private token: string = '';
+  private supabase_key: string = '';
   private printers: PrinterConfig[] = [];
   private formatter = new EscPosFormatter(32); // Largura padrão de 58mm para teste
 
-  setConfig(api_url: string, token: string, printers: PrinterConfig[]) {
+  setConfig(api_url: string, token: string, printers: PrinterConfig[], supabase_key?: string) {
     this.api_url = api_url;
     this.token = token;
     this.printers = printers;
+    this.supabase_key = supabase_key || '';
   }
 
   start(onPollSuccess: (time: string, config: any) => void, onError: (err: string) => void) {
@@ -53,12 +55,21 @@ class PollingService {
 
       try {
         const url = `${this.api_url}/agent-unified-poll`;
+        
+        const headers: any = {
+          'x-api-key': this.token,
+          'Content-Type': 'application/json'
+        };
+
+        // Se tivermos uma chave do Supabase (Anon Key), adicionamos os headers necessários
+        if (this.supabase_key) {
+          headers['apikey'] = this.supabase_key;
+          headers['Authorization'] = `Bearer ${this.supabase_key}`;
+        }
+
         const response = await fetch(url, {
           method: 'GET',
-          headers: {
-            'x-api-key': this.token,
-            'Content-Type': 'application/json'
-          }
+          headers: headers
         });
 
         if (!response.ok) {
@@ -151,12 +162,20 @@ class PollingService {
   private async reportJobStatus(job_id: string, status: string, error_message?: string) {
     try {
       const url = `${this.api_url}/print-job-status`;
+      
+      const headers: any = {
+        'x-api-key': this.token,
+        'Content-Type': 'application/json'
+      };
+
+      if (this.supabase_key) {
+        headers['apikey'] = this.supabase_key;
+        headers['Authorization'] = `Bearer ${this.supabase_key}`;
+      }
+
       await fetch(url, {
         method: 'POST',
-        headers: {
-          'x-api-key': this.token,
-          'Content-Type': 'application/json'
-        },
+        headers: headers,
         body: JSON.stringify({
           job_id,
           status,
@@ -191,6 +210,16 @@ class PollingService {
     try {
       const url = `${this.api_url}/scale-weight-receive`;
       
+      const headers: any = {
+        'x-api-key': this.token,
+        'Content-Type': 'application/json'
+      };
+
+      if (this.supabase_key) {
+        headers['apikey'] = this.supabase_key;
+        headers['Authorization'] = `Bearer ${this.supabase_key}`;
+      }
+
       const body = error_message ? {
         request_id,
         peso: 0,
@@ -205,10 +234,7 @@ class PollingService {
 
       await fetch(url, {
         method: 'POST',
-        headers: {
-          'x-api-key': this.token,
-          'Content-Type': 'application/json'
-        },
+        headers: headers,
         body: JSON.stringify(body)
       });
       
