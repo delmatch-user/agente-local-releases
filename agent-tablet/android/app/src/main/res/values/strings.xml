@@ -1,0 +1,7 @@
+<?xml version='1.0' encoding='utf-8'?>
+<resources>
+    <string name="app_name">MiaCardapio Agent Tablet</string>
+    <string name="title_activity_main">MiaCardapio Agent Tablet</string>
+    <string name="package_name">com.miacardapio.agent</string>
+    <string name="custom_url_scheme">com.miacardapio.agent</string>
+</resources>
