@@ -1,0 +1,29 @@
+# Build outputs
+dist/
+build/
+*.spec
+*.egg-info/
+__pycache__/
+*.pyc
+
+# Config e logs (dados locais)
+config.json
+agente.log
+
+# Arquivos temporários PyInstaller
+_MEI*/
+
+# Outros projetos dentro desta pasta
+agente-local-releases/
+
+# Arquivos gerados
+Output/
+*.sql
+categories.json
+products.json
+cats_final.sql
+setup_cx.py
+setup.iss
+
+# Documentos
+*.docx
