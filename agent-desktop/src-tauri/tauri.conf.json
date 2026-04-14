@@ -68,6 +68,14 @@
       "iconAsTemplate": true,
       "menuOnLeftClick": false
     },
+    "updater": {
+      "active": true,
+      "endpoints": [
+        "https://raw.githubusercontent.com/delmatch-user/agente-local-releases/main/update.json"
+      ],
+      "dialog": true,
+      "pubkey": ""
+    },
     "windows": [
       {
         "fullscreen": false,

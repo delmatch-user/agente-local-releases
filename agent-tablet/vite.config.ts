@@ -7,6 +7,13 @@ export default defineConfig({
     react(),
     VitePWA({ 
       registerType: 'autoUpdate',
+      injectRegister: 'inline',
+      workbox: {
+        globPatterns: ['**/*.{js,css,html,ico,png,svg}'],
+        cleanupOutdatedCaches: true,
+        clientsClaim: true,
+        skipWaiting: true
+      },
       devOptions: {
         enabled: true
       },

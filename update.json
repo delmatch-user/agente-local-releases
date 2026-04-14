@@ -1,0 +1,11 @@
+{
+  "version": "1.0.1",
+  "notes": "Ativado sistema de auto-atualização para Desktop e Tablet",
+  "pub_date": "2026-04-14T15:00:00-03:00",
+  "platforms": {
+    "windows-x86_64": {
+      "signature": "",
+      "url": "https://github.com/delmatch-user/agente-local-releases/releases/latest/download/miacardapio-agent_x64.msi.zip"
+    }
+  }
+}
