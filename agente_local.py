@@ -210,12 +210,17 @@ def ef_poll_jobs():
         payload["areas"] = areas
         log.debug(f"[POLL] Filtrando areas: {areas}")
     resp,s = _post(f"{SUPABASE_URL}/functions/v1/agent-unified-poll", payload, cfg.get("token",""))
-    if s==200 and resp: return resp.get("jobs", resp if isinstance(resp,list) else [])
+    if s==200 and resp:
+        # Servidor retorna print_jobs (com jobs como alias legacy)
+        jobs = resp.get("print_jobs") or resp.get("jobs") or []
+        if isinstance(resp, list): jobs = resp
+        log.debug(f"[POLL] {len(jobs)} job(s) recebido(s)")
+        return jobs
     if s!=200: log.error(f"[POLL] {s}: {resp}")
     return []
 
 def ef_update_job(jid, sv, em=None, pa=None):
-    d={"action":"update","job_id":jid,"status":sv}
+    d={"job_id":jid,"status":sv}
     if em: d["error_message"]=em
     if pa: d["printed_at"]=pa
     _,s=_post(f"{SUPABASE_URL}/functions/v1/print-job-status",d,cfg.get("token",""))
