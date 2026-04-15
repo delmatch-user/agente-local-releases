@@ -30,7 +30,8 @@ if getattr(sys, 'frozen', False):
     BASE_DIR = Path(sys.executable).parent
 CONFIG_PATH  = BASE_DIR / "config.json"
 LOG_PATH     = BASE_DIR / "agente.log"
-SUPABASE_URL = "https://szlyzyflalerxuyxfxzh.supabase.co"
+SUPABASE_URL  = "https://szlyzyflalerxuyxfxzh.supabase.co"
+SUPABASE_ANON = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InN6bHl6eWZsYWxlcnh1eXhmeHpoIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzQwMDkyNTQsImV4cCI6MjA4OTU4NTI1NH0.2UewBvzucel7wiuXv14mvgDmi_FmzCc-Zh2CISL9_VI"
 
 logging.basicConfig(level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -184,11 +185,12 @@ def iniciar_tray():
 
 def _post(url, data, token):
     body = json.dumps(data).encode()
-    headers = {"Content-Type": "application/json", "x-api-key": token}
-    anon_key = cfg.get("anon_key", "")
-    if anon_key:
-        headers["apikey"] = anon_key
-        headers["Authorization"] = f"Bearer {anon_key}"
+    headers = {
+        "Content-Type": "application/json",
+        "x-api-key": token,
+        "apikey": SUPABASE_ANON,
+        "Authorization": f"Bearer {SUPABASE_ANON}",
+    }
     req = urllib.request.Request(url, data=body, method="POST", headers=headers)
     try:
         with urllib.request.urlopen(req, timeout=10) as r:
@@ -219,8 +221,7 @@ def ef_update_job(jid, sv, em=None, pa=None):
     _,s=_post(f"{SUPABASE_URL}/functions/v1/print-job-status",d,cfg.get("token",""))
     return s in (200,204)
 
-def autoconfigurar(token, anon_key=""):
-    cfg["anon_key"] = anon_key  # aplica temporariamente para _post usar os headers corretos
+def autoconfigurar(token):
     resp,s=_post(f"{SUPABASE_URL}/functions/v1/agent-unified-poll",{},token)
     if s==200 and resp: return {"ok":True,"data":resp}
     err_msg = resp.get("error","Token invalido") if resp else "Sem resposta"
@@ -534,17 +535,8 @@ def abrir_boasvindas():
         tk.Label(tf, text=desc, bg="#1a1a2e", fg="#6c7086",
                  font=("Segoe UI", 9)).pack(anchor="w")
 
-    # Input anon_key
-    tk.Label(w, text="Chave Publica Anon (apikey)", bg="#1a1a2e", fg="#a6adc8",
-             font=("Segoe UI", 10)).pack(anchor="w", padx=24)
-    anon_var = tk.StringVar()
-    tk.Entry(w, textvariable=anon_var, show="*", bg="#0d0d1a", fg="#cdd6f4",
-             insertbackground="#cdd6f4", font=("Segoe UI", 11),
-             relief="flat", highlightthickness=1, highlightbackground="#313244",
-             highlightcolor="#5b8dee").pack(fill="x", padx=24, pady=(6,10), ipady=8)
-
     # Input token
-    tk.Label(w, text="Token de API (x-api-key)", bg="#1a1a2e", fg="#a6adc8",
+    tk.Label(w, text="Token de API", bg="#1a1a2e", fg="#a6adc8",
              font=("Segoe UI", 10)).pack(anchor="w", padx=24)
     token_var = tk.StringVar()
     te = tk.Entry(w, textvariable=token_var, show="*", bg="#0d0d1a", fg="#cdd6f4",
@@ -560,17 +552,15 @@ def abrir_boasvindas():
 
     def conectar():
         token = token_var.get().strip()
-        anon_key = anon_var.get().strip()
         if not token:
             status_var.set("Cole o Token de API para continuar.")
             return
         status_var.set("Conectando ao sistema...")
         status_lbl.config(fg="#f9e2af"); w.update()
-        r = autoconfigurar(token, anon_key)
+        r = autoconfigurar(token)
         if r.get("ok"):
             d = r["data"]
             cfg.update({"token": token,
-                        "anon_key": anon_key,
                         "restaurant_id": d.get("restaurant_id",""),
                         "restaurant_name": d.get("restaurant_name",""),
                         "ultima_sincronizacao": time.strftime("%d/%m/%Y %H:%M:%S")})
@@ -820,21 +810,18 @@ def abrir_config():
     inf=tk.Frame(f1,bg="#313244"); inf.grid(row=0,column=0,padx=15,pady=15,sticky="ew")
     tk.Label(inf,text="Cole o Token de API gerado no sistema MIA.\nO agente se configurara automaticamente.",
              bg="#313244",fg="#a6c8e0",font=("Segoe UI",9),pady=8,justify="center").pack()
-    ttk.Label(f1,text="Chave Publica Anon (apikey):").grid(row=1,column=0,sticky="w",padx=15,pady=(8,2))
-    av=tk.StringVar(value=cfg.get("anon_key","")); ae=ttk.Entry(f1,textvariable=av,width=65,show="*")
-    ae.grid(row=2,column=0,padx=15,sticky="ew")
-    ttk.Label(f1,text="Token de API (x-api-key):").grid(row=3,column=0,sticky="w",padx=15,pady=(8,2))
+    ttk.Label(f1,text="Token de API:").grid(row=1,column=0,sticky="w",padx=15,pady=4)
     tv=tk.StringVar(value=cfg.get("token","")); te=ttk.Entry(f1,textvariable=tv,width=65,show="*")
-    te.grid(row=4,column=0,padx=15,sticky="ew"); sv2=tk.StringVar(value="")
+    te.grid(row=2,column=0,padx=15,sticky="ew"); sv2=tk.StringVar(value="")
 
     def conectar():
-        token=tv.get().strip(); anon_key=av.get().strip()
+        token=tv.get().strip()
         if not token: messagebox.showwarning("Aviso","Cole o Token!",parent=w); return
         sv2.set("Conectando..."); w.update()
-        r=autoconfigurar(token, anon_key)
+        r=autoconfigurar(token)
         if r.get("ok"):
             d=r["data"]
-            cfg.update({"token":token,"anon_key":anon_key,"restaurant_id":d.get("restaurant_id",""),
+            cfg.update({"token":token,"restaurant_id":d.get("restaurant_id",""),
                         "restaurant_name":d.get("restaurant_name",""),
                         "ultima_sincronizacao":time.strftime("%d/%m/%Y %H:%M:%S")})
             printers=d.get("printers",[]); icfg=[]
