@@ -235,7 +235,7 @@ def sincronizar_impressoras():
     if not token: return
     resp,s = _post(f"{SUPABASE_URL}/functions/v1/agent-unified-poll",{"action":"poll"},token)
     if s==200 and resp:
-        printers = resp.get("printers", [])
+        printers = resp.get("config",{}).get("printers", [])
         if not printers: return
         iw = listar_impressoras_windows()
         imps_atuais = {i.get("nome"):i for i in cfg.get("impressoras",[])}
@@ -596,7 +596,7 @@ def abrir_boasvindas():
                         "restaurant_id": d.get("restaurant_id",""),
                         "restaurant_name": d.get("restaurant_name",""),
                         "ultima_sincronizacao": time.strftime("%d/%m/%Y %H:%M:%S")})
-            printers = d.get("printers", [])
+            printers = d.get("config",{}).get("printers", d.get("printers", []))
             iw = listar_impressoras_windows()
             imps = []
             for p in printers:
@@ -856,7 +856,7 @@ def abrir_config():
             cfg.update({"token":token,"restaurant_id":d.get("restaurant_id",""),
                         "restaurant_name":d.get("restaurant_name",""),
                         "ultima_sincronizacao":time.strftime("%d/%m/%Y %H:%M:%S")})
-            printers=d.get("printers",[]); icfg=[]
+            printers=d.get("config",{}).get("printers", d.get("printers",[])); icfg=[]
             for p in printers:
                 ns=p.get("name",""); ts=p.get("printer_type","receipt")
                 area={"receipt":"caixa","kitchen":"cozinha","bar":"bar"}.get(ts,"caixa")
