@@ -222,12 +222,38 @@ def ef_update_job(jid, sv, em=None, pa=None):
     return s in (200,204)
 
 def autoconfigurar(token):
-    resp,s=_post(f"{SUPABASE_URL}/functions/v1/agent-unified-poll",{},token)
+    resp,s=_post(f"{SUPABASE_URL}/functions/v1/agent-unified-poll",{"action":"poll"},token)
     if s==200 and resp: return {"ok":True,"data":resp}
     err_msg = resp.get("error","Token invalido") if resp else "Sem resposta"
     if resp and "debug" in resp:
         err_msg += f"\nDebug: {resp['debug']}"
     return {"ok":False,"erro":err_msg}
+
+def sincronizar_impressoras():
+    """Busca impressoras atualizadas do servidor e atualiza config local"""
+    token = cfg.get("token","")
+    if not token: return
+    resp,s = _post(f"{SUPABASE_URL}/functions/v1/agent-unified-poll",{"action":"poll"},token)
+    if s==200 and resp:
+        printers = resp.get("printers", [])
+        if not printers: return
+        iw = listar_impressoras_windows()
+        imps_atuais = {i.get("nome"):i for i in cfg.get("impressoras",[])}
+        imps_novos = []
+        for p in printers:
+            ns = p.get("name",""); ts = p.get("printer_type","receipt")
+            area = {"receipt":"caixa","kitchen":"cozinha","bar":"bar"}.get(ts,"caixa")
+            # Preserva mapeamento manual já feito pelo usuário
+            existente = imps_atuais.get(ns)
+            if existente:
+                imps_novos.append(existente)
+            else:
+                match = next((x for x in iw if ns.upper()[:5] in x.upper() or x.upper()[:5] in ns.upper()),"")
+                imps_novos.append({"nome":ns,"area":area,"printer_type":ts,"nome_impressora":match,"tipo":"comum_win32","modo":"texto"})
+        if imps_novos != cfg.get("impressoras",[]):
+            cfg["impressoras"] = imps_novos
+            salvar_config(cfg)
+            log.info(f"[SYNC] Impressoras atualizadas: {[i.get('nome') for i in imps_novos]}")
 
 def ef_get_order(oid):
     resp,s=_post(f"{SUPABASE_URL}/functions/v1/agent-get-order",{"order_id":oid},cfg.get("token",""))
@@ -476,9 +502,15 @@ def poll():
 async def loop_poll():
     iv=int(cfg.get("poll_interval",3))
     log.info(f"[POLL] Iniciando a cada {iv}s")
+    ciclos = 0
     while True:
         try: poll()
         except Exception as e: log.error(f"[POLL] {e}")
+        ciclos += 1
+        # Re-sincroniza impressoras do servidor a cada 5 minutos
+        if ciclos % max(1, int(300 / max(iv,1))) == 0:
+            try: sincronizar_impressoras()
+            except Exception as e: log.error(f"[SYNC] {e}")
         await asyncio.sleep(iv)
 
 
@@ -850,9 +882,17 @@ def abrir_config():
         tk.Label(rf,text=f"ID: {cfg.get('restaurant_id','')}",bg="#313244",fg="#6c7086",font=("Segoe UI",8)).pack()
     tk.Label(rf,text=f"Ultima sincronizacao: {cfg.get('ultima_sincronizacao','Nunca')}",
              bg="#313244",fg="#6c7086",font=("Segoe UI",8),pady=4).pack()
-    cs="#a6e3a1" if "Ativo" in status_poll else "#f38ba8"
     sf=tk.Frame(f1,bg="#313244"); sf.grid(row=8,column=0,padx=15,pady=5,sticky="ew")
-    tk.Label(sf,text=f"Status: {status_poll}",bg="#313244",fg=cs,font=("Segoe UI",10,"bold"),pady=8).pack()
+    sv_status=tk.StringVar(value=f"Status: {status_poll}")
+    cs="#a6e3a1" if "Ativo" in status_poll else "#f38ba8"
+    lbl_status=tk.Label(sf,textvariable=sv_status,bg="#313244",fg=cs,font=("Segoe UI",10,"bold"),pady=8)
+    lbl_status.pack()
+    def _atualizar_status_config():
+        sv_status.set(f"Status: {status_poll}")
+        cor="#a6e3a1" if "Ativo" in status_poll else "#f38ba8"
+        lbl_status.config(fg=cor)
+        if sf.winfo_exists(): sf.after(1000, _atualizar_status_config)
+    _atualizar_status_config()
     ttk.Label(f1,text="Intervalo polling (s):").grid(row=9,column=0,sticky="w",padx=15,pady=8)
     pv=tk.StringVar(value=str(cfg.get("poll_interval",3))); ttk.Entry(f1,textvariable=pv,width=8).grid(row=10,column=0,sticky="w",padx=15)
     f1.columnconfigure(0,weight=1)
