@@ -183,7 +183,7 @@ def iniciar_tray():
     _tray_icon = pystray.Icon("AgenteLocal", _criar_icone((239,68,68)), "Agente Local", menu)
     threading.Thread(target=_tray_icon.run, daemon=True).start()
 
-def _post(url, data, token):
+def _post(url, data, token, timeout=30, retries=2):
     body = json.dumps(data).encode()
     headers = {
         "Content-Type": "application/json",
@@ -191,15 +191,21 @@ def _post(url, data, token):
         "apikey": SUPABASE_ANON,
         "Authorization": f"Bearer {SUPABASE_ANON}",
     }
-    req = urllib.request.Request(url, data=body, method="POST", headers=headers)
-    try:
-        with urllib.request.urlopen(req, timeout=10) as r:
-            return json.loads(r.read()), r.status
-    except urllib.error.HTTPError as e:
-        try: return json.loads(e.read()), e.code
-        except: return {"error":str(e)}, e.code
-    except Exception as e:
-        log.error(f"HTTP: {e}"); return None, 0
+    for tentativa in range(retries + 1):
+        req = urllib.request.Request(url, data=body, method="POST", headers=headers)
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                return json.loads(r.read()), r.status
+        except urllib.error.HTTPError as e:
+            try: return json.loads(e.read()), e.code
+            except: return {"error":str(e)}, e.code
+        except Exception as e:
+            if tentativa < retries:
+                log.warning(f"HTTP tentativa {tentativa+1} falhou: {e} - retentando...")
+                time.sleep(2)
+            else:
+                log.error(f"HTTP: {e}")
+                return None, 0
 
 def ef_poll_jobs():
     # Coleta areas unicas configuradas nas impressoras
