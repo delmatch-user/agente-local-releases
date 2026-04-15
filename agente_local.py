@@ -945,6 +945,14 @@ def abrir_config():
         if not nova: messagebox.showwarning("Aviso","Selecione a Impressora Windows!",parent=w); return
         vals=ti.item(sel[0],"values"); ti.item(sel[0],values=(vals[0],vals[1],nova,vals[3]),tags=("",))
         lbe.config(text=f"OK: {vals[0]} -> {nova}",fg="#a6e3a1"); eiw.set("")
+        # Salva imediatamente no cfg e no disco
+        nome_sistema = vals[0]
+        for imp in cfg.get("impressoras",[]):
+            if imp.get("nome") == nome_sistema:
+                imp["nome_impressora"] = nova
+                break
+        salvar_config(cfg)
+        log.info(f"[CONFIG] Impressora '{nome_sistema}' mapeada para '{nova}'")
 
     ti.bind("<Double-1>",duplo)
     tk.Button(ef2,text="Aplicar",command=aplicar,bg="#89b4fa",fg="#1e1e2e",
