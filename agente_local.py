@@ -1,0 +1,1720 @@
+"""Agente Local v3.4 - GUI na main thread, polling em background"""
+import asyncio, json, logging, sys, time, threading, os, subprocess, winreg, queue
+from pathlib import Path
+import tkinter as tk
+from tkinter import ttk, messagebox, scrolledtext
+import urllib.request, urllib.error
+
+try:
+    import pystray
+    from PIL import Image, ImageDraw
+    HAS_TRAY = True
+except ImportError:
+    HAS_TRAY = False
+
+try:
+    import win32print
+    HAS_WIN32 = True
+except ImportError:
+    HAS_WIN32 = False
+
+try:
+    import serial, serial.tools.list_ports
+    HAS_SERIAL = True
+except ImportError:
+    HAS_SERIAL = False
+
+BASE_DIR     = Path(sys.executable).parent if getattr(sys, 'frozen', False) else Path(__file__).parent
+# Garante que o log sempre fica na pasta do exe, nao na pasta de trabalho
+if getattr(sys, 'frozen', False):
+    BASE_DIR = Path(sys.executable).parent
+CONFIG_PATH  = BASE_DIR / "config.json"
+LOG_PATH     = BASE_DIR / "agente.log"
+SUPABASE_URL  = "https://szlyzyflalerxuyxfxzh.supabase.co"
+SUPABASE_ANON = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InN6bHl6eWZsYWxlcnh1eXhmeHpoIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzQwMDkyNTQsImV4cCI6MjA4OTU4NTI1NH0.2UewBvzucel7wiuXv14mvgDmi_FmzCc-Zh2CISL9_VI"
+
+logging.basicConfig(level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[logging.StreamHandler(sys.stdout),
+              logging.FileHandler(LOG_PATH, encoding="utf-8")])
+log = logging.getLogger("agente")
+
+_gui_queue      = queue.Queue()
+_root           = None
+_tray_icon      = None
+status_poll     = "Iniciando..."
+_start_time     = time.time()
+_stats = {
+    "total_impressos": 0,
+    "hoje": 0,
+    "hoje_data": "",
+    "erros": 0,
+    "ultimo_job": None,
+    "ultimo_erro": None,
+    "ultima_impressora": "",
+    "historico": [],  # lista dos ultimos 50 jobs
+}
+
+def carregar_config():
+    if CONFIG_PATH.exists():
+        with open(CONFIG_PATH, encoding="utf-8") as f:
+            return json.load(f)
+    return {"token":"","anon_key":"","restaurant_id":"","restaurant_name":"","poll_interval":3,
+            "impressoras":[],"balancas":[],"ultima_sincronizacao":""}
+
+def salvar_config(c):
+    with open(CONFIG_PATH, "w", encoding="utf-8") as f:
+        json.dump(c, f, ensure_ascii=False, indent=2)
+
+cfg = carregar_config()
+
+def listar_impressoras_windows():
+    if HAS_WIN32:
+        try: return [p[2] for p in win32print.EnumPrinters(
+                win32print.PRINTER_ENUM_LOCAL | win32print.PRINTER_ENUM_CONNECTIONS)]
+        except: pass
+    try:
+        r = subprocess.run(["powershell","-Command","Get-Printer | Select-Object -ExpandProperty Name"],
+                           capture_output=True, text=True, timeout=5)
+        return [l.strip() for l in r.stdout.splitlines() if l.strip()]
+    except: return []
+
+def listar_portas_serial():
+    if HAS_SERIAL:
+        try: return [p.device for p in serial.tools.list_ports.comports()]
+        except: pass
+    return ["COM1","COM2","COM3","COM4","COM5","COM6"]
+
+def _criar_icone(cor):
+    img = Image.new("RGBA",(64,64),(0,0,0,0))
+    dc  = ImageDraw.Draw(img)
+    dc.ellipse([4,4,60,60],fill=cor)
+    dc.rectangle([20,28,44,36],fill="white")
+    dc.rectangle([28,20,36,44],fill="white")
+    return img
+
+def _atualizar_icone():
+    if _tray_icon and HAS_TRAY:
+        cor = (34,197,94) if "Ativo" in status_poll else (239,68,68)
+        _tray_icon.icon  = _criar_icone(cor)
+        _tray_icon.title = f"Agente Local - {status_poll}"
+
+
+def _garantir_startup():
+    """Garante startup via registro HKCU - metodo mais confiavel"""
+    import winreg, sys
+    from pathlib import Path
+    try:
+        if getattr(sys, 'frozen', False):
+            # Usa variavel de ambiente para evitar problema com acento no username
+            import os
+            exe = os.path.join(os.environ.get("USERPROFILE", str(Path.home())),
+                               "Desktop", "Agente Local", "dist", "AgenteLocal.exe")
+            if not Path(exe).exists():
+                exe = str(Path(sys.executable).resolve())
+        else:
+            exe = str((Path(__file__).resolve().parent / "dist" / "AgenteLocal.exe"))
+        
+        if not Path(exe).exists():
+            log.warning(f"[STARTUP] exe nao encontrado: {exe}")
+            return
+            
+        key = winreg.OpenKey(
+            winreg.HKEY_CURRENT_USER,
+            r"Software\Microsoft\Windows\CurrentVersion\Run",
+            0, winreg.KEY_SET_VALUE | winreg.KEY_QUERY_VALUE
+        )
+        
+        # Verifica se ja esta correto
+        try:
+            val, _ = winreg.QueryValueEx(key, "AgenteLocal")
+            if val == exe:
+                log.info(f"[STARTUP] Ja registrado corretamente: {exe}")
+                winreg.CloseKey(key)
+                return
+        except FileNotFoundError:
+            pass
+        
+        winreg.SetValueEx(key, "AgenteLocal", 0, winreg.REG_SZ, exe)
+        winreg.CloseKey(key)
+        log.info(f"[STARTUP] Registrado: {exe}")
+        
+        # Cria tambem um VBS como backup (nao precisa de admin)
+        try:
+            vbs_path = Path(exe).parent / "iniciar_agente.vbs"
+            vbs_content = f'Set ws = CreateObject("WScript.Shell")\nws.Run Chr(34) & "{exe}" & Chr(34), 0, False'
+            vbs_path.write_text(vbs_content, encoding='utf-8')
+            
+            startup_folder = Path.home() / "AppData" / "Roaming" / "Microsoft" / "Windows" / "Start Menu" / "Programs" / "Startup"
+            if startup_folder.exists():
+                lnk_path = startup_folder / "AgenteLocal MIA.lnk"
+                import subprocess
+                ps = (
+                    f'$ws=New-Object -ComObject WScript.Shell;'
+                    f'$s=$ws.CreateShortcut("{lnk_path}");'
+                    f'$s.TargetPath="{exe}";'
+                    f'$s.WorkingDirectory="{Path(exe).parent}";'
+                    f'$s.WindowStyle=7;'
+                    f'$s.Save()'
+                )
+                subprocess.run(
+                    ["powershell", "-NoProfile", "-Command", ps],
+                    capture_output=True, timeout=10
+                )
+                if lnk_path.exists():
+                    log.info(f"[STARTUP] Atalho na pasta Startup criado: {lnk_path}")
+        except Exception as e:
+            log.warning(f"[STARTUP] VBS/Startup backup falhou: {e}")
+            
+    except Exception as e:
+        log.error(f"[STARTUP] Erro ao registrar startup: {e}")
+
+def iniciar_tray():
+    global _tray_icon
+    if not HAS_TRAY: return
+    menu = pystray.Menu(
+        pystray.MenuItem("Status",        lambda _: _gui_queue.put("dashboard"), default=True),
+        pystray.MenuItem("Configuracoes", lambda _: _gui_queue.put("config")),
+        pystray.MenuItem("Ver Log",       lambda _: _gui_queue.put("log")),
+        pystray.Menu.SEPARATOR,
+        pystray.MenuItem("Reiniciar",      lambda _: _gui_queue.put("reiniciar")),
+        pystray.MenuItem("Sair",          lambda _: _gui_queue.put("sair")),
+    )
+    _tray_icon = pystray.Icon("AgenteLocal", _criar_icone((239,68,68)), "Agente Local", menu)
+    threading.Thread(target=_tray_icon.run, daemon=True).start()
+
+def _post(url, data, token, timeout=30, retries=2):
+    body = json.dumps(data).encode()
+    headers = {
+        "Content-Type": "application/json",
+        "x-api-key": token,
+        "apikey": SUPABASE_ANON,
+        "Authorization": f"Bearer {SUPABASE_ANON}",
+    }
+    for tentativa in range(retries + 1):
+        req = urllib.request.Request(url, data=body, method="POST", headers=headers)
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                return json.loads(r.read()), r.status
+        except urllib.error.HTTPError as e:
+            try: return json.loads(e.read()), e.code
+            except: return {"error":str(e)}, e.code
+        except Exception as e:
+            if tentativa < retries:
+                log.warning(f"HTTP tentativa {tentativa+1} falhou: {e} - retentando...")
+                time.sleep(2)
+            else:
+                log.error(f"HTTP: {e}")
+                return None, 0
+
+def ef_poll_jobs():
+    # Coleta areas unicas configuradas nas impressoras
+    imps = cfg.get("impressoras", [])
+    areas = list(set([i.get("area","") for i in imps if i.get("area") and i.get("nome_impressora")]))
+    payload = {"action": "poll"}
+    if areas:
+        payload["areas"] = areas
+        log.debug(f"[POLL] Filtrando areas: {areas}")
+    resp,s = _post(f"{SUPABASE_URL}/functions/v1/agent-unified-poll", payload, cfg.get("token",""))
+    if s==200 and resp:
+        # Servidor retorna print_jobs (com jobs como alias legacy)
+        jobs = resp.get("print_jobs") or resp.get("jobs") or []
+        if isinstance(resp, list): jobs = resp
+        log.debug(f"[POLL] {len(jobs)} job(s) recebido(s)")
+        return jobs
+    if s!=200: log.error(f"[POLL] {s}: {resp}")
+    return []
+
+def ef_update_job(jid, sv, em=None, pa=None):
+    d={"job_id":jid,"status":sv}
+    if em: d["error_message"]=em
+    if pa: d["printed_at"]=pa
+    _,s=_post(f"{SUPABASE_URL}/functions/v1/print-job-status",d,cfg.get("token",""))
+    return s in (200,204)
+
+def autoconfigurar(token):
+    resp,s=_post(f"{SUPABASE_URL}/functions/v1/agent-unified-poll",{"action":"poll"},token)
+    if s==200 and resp: return {"ok":True,"data":resp}
+    err_msg = resp.get("error","Token invalido") if resp else "Sem resposta"
+    if resp and "debug" in resp:
+        err_msg += f"\nDebug: {resp['debug']}"
+    return {"ok":False,"erro":err_msg}
+
+def sincronizar_impressoras():
+    """Busca impressoras atualizadas do servidor e atualiza config local"""
+    token = cfg.get("token","")
+    if not token: return
+    resp,s = _post(f"{SUPABASE_URL}/functions/v1/agent-unified-poll",{"action":"poll"},token)
+    if s==200 and resp:
+        printers = resp.get("config",{}).get("printers", resp.get("printers", []))
+        if not printers: return
+        iw = listar_impressoras_windows()
+        imps_atuais = {i.get("nome"):i for i in cfg.get("impressoras",[])}
+        imps_novos = []
+        for p in printers:
+            ns = p.get("name",""); ts = p.get("printer_type","receipt")
+            area = {"receipt":"caixa","kitchen":"cozinha","bar":"bar"}.get(ts,"caixa")
+            
+            # Preserva mapeamento manual já feito pelo usuário
+            existente = imps_atuais.get(ns)
+            if existente and existente.get("nome_impressora"):
+                imps_novos.append(existente)
+            else:
+                # Tenta match inteligente
+                match = ""
+                # 1. Match exato
+                if ns in iw: match = ns
+                # 2. Match parcial (ex: "CAIXA" in "EPSON CAIXA")
+                if not match:
+                   match = next((x for x in iw if ns.upper() in x.upper() or x.upper() in ns.upper()), "")
+                # 3. Match primeiro nome (ex: "TP-650" em "TANCA TP-650")
+                if not match and " " in ns:
+                   first = ns.split(" ")[0].upper()
+                   if len(first) > 2:
+                      match = next((x for x in iw if first in x.upper()), "")
+
+                imps_novos.append({"nome":ns,"area":area,"printer_type":ts,"nome_impressora":match,"tipo":"comum_win32","modo":"texto"})
+        
+        if str(imps_novos) != str(cfg.get("impressoras",[])):
+            cfg["impressoras"] = imps_novos
+            salvar_config(cfg)
+            log.info(f"[SYNC] Impressoras atualizadas: {[i.get('nome') for i in imps_novos]}")
+
+def ef_get_order(oid):
+    resp,s=_post(f"{SUPABASE_URL}/functions/v1/agent-get-order",{"order_id":oid},cfg.get("token",""))
+    if s==200 and resp: return resp
+    log.error(f"[ORDER] Erro {oid}: {s}"); return None
+
+def ef_enviar_peso(nome_balanca, peso_kg):
+    try:
+        payload = {
+            "action": "scale_reading",
+            "restaurant_id": cfg.get("restaurant_id",""),
+            "scale_name": nome_balanca,
+            "weight_kg": round(peso_kg, 3),
+            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        }
+        _post(f"{SUPABASE_URL}/functions/v1/agente-print-jobs", payload, cfg.get("token",""))
+    except Exception as e:
+        log.debug(f"[PESO] Erro ao enviar: {e}")
+
+_pesos_atuais = {}
+_ultimo_envio_peso = {}
+
+def _callback_peso(nome, peso_kg, status):
+    global _pesos_atuais, _ultimo_envio_peso
+    _pesos_atuais[nome] = {"peso": peso_kg, "status": status, "hora": time.strftime("%H:%M:%S")}
+    log.debug(f"[PESO] {nome}: {peso_kg:.3f} kg")
+    agora = time.time()
+    if agora - _ultimo_envio_peso.get(nome, 0) >= 1.0:
+        _ultimo_envio_peso[nome] = agora
+        ef_enviar_peso(nome, peso_kg)
+
+def _imprimir_raw(nome, conteudo):
+    try:
+        if HAS_WIN32:
+            h=win32print.OpenPrinter(nome)
+            try:
+                win32print.StartDocPrinter(h,1,("Cupom",None,"RAW"))
+                win32print.StartPagePrinter(h)
+                
+                # Se for string, codifica. Se for bytes (RAW), envia direto.
+                if isinstance(conteudo, str):
+                    win32print.WritePrinter(h,(conteudo+"\n\n\n\n\n\x1b\x64\x05\x1d\x56\x00").encode("cp850","replace"))
+                else:
+                    win32print.WritePrinter(h, conteudo)
+                
+                win32print.EndPagePrinter(h)
+                win32print.EndDocPrinter(h)
+            finally: win32print.ClosePrinter(h)
+            return {"ok":True}
+        return {"ok":False,"erro":"win32print indisponivel"}
+    except Exception as e: return {"ok":False,"erro":str(e)}
+
+def _R(v):
+    try: return f"R$ {int(v)/100:.2f}"
+    except: return "R$ 0,00"
+
+W=48
+TL={"counter":"BALCAO","dine_in":"MESA","takeaway":"RETIRADA","delivery":"DELIVERY"}
+PL={"cash":"Dinheiro","credit":"Cartao Credito","debit":"Cartao Debito","pix":"PIX"}
+
+def _li(q,n,p):
+    pv=_R(int(q)*int(p)); b=f"{q}x {n}"; e=W-len(b)-len(pv)
+    return b+(" "*max(1,e))+pv if e>=1 else f"{b}\n{pv:>{W}}"
+
+def _fmt(content, jt, pt):
+    tipo=content.get("type",jt); ll=[]; S="-"*W
+    if tipo in ("order","receipt"):
+        ne=content.get("company_name","") or cfg.get("restaurant_name","")
+        if ne: ll.append(ne.upper().center(W))
+        e=content.get("company_address","")
+        if e: ll.append(e.center(W))
+        t=content.get("company_phone","")
+        if t: ll.append(f"Tel: {t}".center(W))
+        ll.append(S)
+        n=content.get("order_number","")
+        if n: ll.append(f"PEDIDO #{n}".center(W))
+        tp=content.get("order_type","")
+        if tp: ll.append(f"** {TL.get(tp,tp.upper())} **".center(W))
+        c2=content.get("customer_name","")
+        if c2: ll.append(f"Cliente: {c2}")
+        m=content.get("table_number","")
+        if m: ll.append(f"Mesa: {m}")
+        try:
+            from datetime import datetime
+            dt=content.get("created_at","")
+            ll.append(f"Data: {datetime.fromisoformat(dt.replace('Z','+00:00')).strftime('%d/%m/%Y %H:%M')}")
+        except: pass
+        ll.append(S)
+        for item in content.get("items",[]):
+            ll.append(_li(item.get("quantity",1),item.get("name",""),item.get("unit_price_cents",0)))
+            obs=item.get("notes","")
+            if obs: ll.append(f"  Obs: {obs}")
+            for a in item.get("addons",[]):
+                pc=a.get("price_cents",0)
+                ll.append(f"  + {a.get('name','')}{f' {_R(pc)}' if pc else ''}")
+        ll.append(S)
+        sub=content.get("subtotal_cents",0); desc=content.get("discount_cents",0)
+        ent=content.get("delivery_fee_cents",0); tot=content.get("total_cents",0)
+        if sub:
+            sv=_R(sub); ll.append(f"{'Subtotal:':<{W-len(sv)}}{sv}")
+        if desc and int(desc)>0:
+            dv=f"-{_R(desc)}"; ll.append(f"{'Desconto:':<{W-len(dv)}}{dv}")
+        if ent and int(ent)>0:
+            ev=_R(ent); ll.append(f"{'Taxa entrega:':<{W-len(ev)}}{ev}")
+        tv=_R(tot); ll.append(f"{'TOTAL:':<{W-len(tv)}}{tv}")
+        pg=content.get("payment_method","")
+        if pg: ll.append(f"Pagamento: {PL.get(pg,pg)}")
+        cod=content.get("pickup_code","")
+        if cod: ll.append("="*W); ll.append(f"RETIRADA: {cod}".center(W)); ll.append("="*W)
+        obs2=content.get("notes","")
+        if obs2: ll.append(S); ll.append(f"Obs: {obs2}")
+        rod=content.get("footer_message","")
+        if rod: ll.append(S); ll.append(rod.center(W))
+        ll.append(S)
+    elif tipo=="kitchen":
+        ll+=["*"*W,"COZINHA".center(W),"*"*W]
+        n=content.get("order_number","")
+        if n: ll.append(f"PEDIDO #{n}".center(W))
+        tp=content.get("order_type","")
+        if tp: ll.append(f"** {TL.get(tp,tp.upper())} **".center(W))
+        m=content.get("table_number","")
+        if m: ll.append(f"Mesa: {m}")
+        c2=content.get("customer_name","")
+        if c2: ll.append(f"Cliente: {c2}")
+        try:
+            from datetime import datetime
+            dt=content.get("created_at","")
+            ll.append(f"Hora: {datetime.fromisoformat(dt.replace('Z','+00:00')).strftime('%H:%M')}")
+        except: pass
+        ll.append(S)
+        for item in content.get("items",[]):
+            q=item.get("quantity",item.get("qty",1)); ll.append(f"  {q}x  {item.get('name','')}")
+            obs=item.get("notes","")
+            if obs: ll.append(f"     >> {obs}")
+            for a in item.get("addons",[]): ll.append(f"     + {a.get('name','')}")
+        obs2=content.get("notes","")
+        if obs2: ll.append(S); ll.append(f"OBS: {obs2}")
+        ll.append(S)
+    elif tipo=="bar":
+        ll+=["*"*W,"BAR".center(W),"*"*W]
+        n=content.get("order_number","")
+        if n: ll.append(f"PEDIDO #{n}".center(W))
+        m=content.get("table_number","")
+        if m: ll.append(f"Mesa: {m}")
+        ll.append(S)
+        for item in content.get("items",[]):
+            q=item.get("quantity",item.get("qty",1)); ll.append(f"  {q}x  {item.get('name','')}")
+            obs=item.get("notes","")
+            if obs: ll.append(f"     >> {obs}")
+        ll.append(S)
+    elif tipo=="pickup":
+        ne=cfg.get("restaurant_name","")
+        if ne: ll.append(ne.upper().center(W))
+        ll.append("*** RETIRADA ***".center(W))
+        cod=content.get("pickup_code","")
+        if cod: ll.append(f"CODIGO: {cod}".center(W))
+        c2=content.get("customer_name","")
+        if c2: ll.append(f"Cliente: {c2}")
+        ll.append(f"Total: {_R(content.get('total_cents',0))}"); ll.append(S)
+    elif tipo=="delivery":
+        ne=content.get("company_name","") or cfg.get("restaurant_name","")
+        if ne: ll.append(ne.upper().center(W))
+        ll.append("*** ENTREGA ***".center(W)); ll.append(S)
+        n=content.get("order_number","")
+        if n: ll.append(f"PEDIDO #{n}".center(W))
+        c2=content.get("customer_name","")
+        if c2: ll.append(f"Cliente: {c2}")
+        t2=content.get("customer_phone","")
+        if t2: ll.append(f"Tel: {t2}")
+        ll.append(S)
+        for item in content.get("items",[]): ll.append(f"  {item.get('quantity',1)}x  {item.get('name','')}")
+        ll.append(S); tv=_R(content.get("total_cents",0)); ll.append(f"TOTAL: {tv}")
+        pg=content.get("payment_method","")
+        if pg: ll.append(f"Pagamento: {PL.get(pg,pg)}")
+        ll.append(S)
+    elif tipo=="command":
+        if content.get("command")=="open_drawer": return "\x1b\x70\x00\x19\xfa"
+    elif tipo=="test_page":
+        ll+=["="*W,"   AGENTE LOCAL - TESTE OK!   ".center(W),"="*W,
+             content.get("title","Teste"),content.get("message",""),
+             f"Hora: {time.strftime('%d/%m/%Y %H:%M:%S')}","="*W]
+    else:
+        ll.append(f"JOB: {tipo}"); ll.append(json.dumps(content,ensure_ascii=False)[:200])
+    return "\n".join(ll)
+
+def _res_imp(pt):
+    imps=cfg.get("impressoras",[])
+    areas={"receipt":["caixa","receipt"],"kitchen":["cozinha","kitchen"],"bar":["bar"]}.get(pt,["caixa"])
+    for i in imps:
+        if i.get("area") in areas or i.get("printer_type")==pt:
+            n=i.get("nome_impressora","")
+            if n: return n
+    if imps: return imps[0].get("nome_impressora","")
+    return ""
+
+def proc_job(job):
+    jid=job.get("id"); pt=job.get("printer_type","receipt")
+    content=job.get("content",{}); copies=int(job.get("copies",1)); jt=job.get("job_type","order")
+    log.info(f"[PRINT] Job {jid} tipo={pt}")
+    oid=content.get("order_id")
+    if oid and len(content)<=3:
+        p=ef_get_order(oid)
+        if p: content=p; log.info("[ORDER] OK")
+        else: log.error(f"[ORDER] Falha {oid}")
+    nome=_res_imp(pt)
+    if not nome:
+        ef_update_job(jid,"failed",f"Sem impressora para '{pt}'"); return
+        
+    # PRIORIDADE: Usa dados formatados do servidor (ESC/POS RAW) se existirem
+    escpos_b64 = job.get("escpos_data")
+    if escpos_b64:
+        import base64
+        try:
+            dados_brutos = base64.b64decode(escpos_b64)
+            log.info(f"[PRINT] Usando layout do sistema (RAW) para Job {jid}")
+            for _ in range(copies):
+                r = _imprimir_raw(nome, dados_brutos)
+                if not r.get("ok"):
+                    _stats["erros"] += 1
+                    _stats["ultimo_erro"] = r.get("erro","")
+                    reportar_erro_supabase(jid, nome, r.get("erro",""), jt)
+                    ef_update_job(jid, "failed", r.get("erro",""))
+                    return
+        except Exception as e:
+            log.error(f"[PRINT] Erro ao decodificar ESC/POS do sistema: {e}")
+            # Se falhou, nao faz nada e tenta o layout local abaixo
+    else:
+        # FALLBACK: Layout antigo/local (se o servidor nao mandou escpos_data)
+        texto=_fmt(content,jt,pt)
+        for _ in range(copies):
+            r=_imprimir_raw(nome,texto)
+            if not r.get("ok"):
+                _stats["erros"] += 1
+                _stats["ultimo_erro"] = r.get("erro","")
+                reportar_erro_supabase(jid, nome, r.get("erro",""), jt)
+                ef_update_job(jid,"failed",r.get("erro","")); return
+                
+    ef_update_job(jid,"printed",pa=time.strftime("%Y-%m-%dT%H:%M:%SZ",time.gmtime()))
+    log.info(f"[PRINT] Job {jid} OK em '{nome}'")
+    _stats["total_impressos"] += 1
+    _stats["ultimo_job"] = time.strftime("%H:%M:%S")
+    _stats["ultima_impressora"] = nome
+    # Contador diario - reseta meia-noite
+    hoje = time.strftime("%d/%m/%Y")
+    if _stats["hoje_data"] != hoje:
+        _stats["hoje"] = 0
+        _stats["hoje_data"] = hoje
+    _stats["hoje"] += 1
+    # Historico dos ultimos 50 jobs
+    entrada = {
+        "hora": time.strftime("%H:%M:%S"),
+        "data": hoje,
+        "impressora": nome,
+        "tipo": pt,
+        "job_id": jid,
+        "content_ref": content.get("order_number","") or content.get("order_id","")[:8] if content else ""
+    }
+    _stats["historico"].insert(0, entrada)
+    if len(_stats["historico"]) > 50:
+        _stats["historico"] = _stats["historico"][:50]
+
+def poll():
+    global status_poll
+    jobs=ef_poll_jobs()
+    if jobs:
+        status_poll=f"Ativo - {len(jobs)} job(s)"
+        log.info(f"[POLL] {len(jobs)} job(s)")
+        for job in jobs:
+            ef_update_job(job["id"],"sent")
+            threading.Thread(target=proc_job,args=(job,),daemon=True).start()
+    else: status_poll="Ativo - aguardando"
+    _atualizar_icone()
+
+async def loop_poll():
+    iv=int(cfg.get("poll_interval",3))
+    log.info(f"[POLL] Iniciando a cada {iv}s")
+    ciclos = 0
+    while True:
+        try: poll()
+        except Exception as e: log.error(f"[POLL] {e}")
+        ciclos += 1
+        # Re-sincroniza impressoras do servidor a cada 5 minutos
+        if ciclos % max(1, int(300 / max(iv,1))) == 0:
+            try: sincronizar_impressoras()
+            except Exception as e: log.error(f"[SYNC] {e}")
+        await asyncio.sleep(iv)
+
+
+def abrir_boasvindas():
+    """Tela de boas-vindas para primeira configuracao"""
+    global cfg
+    w = tk.Toplevel(_root)
+    w.title("Concentrador de Impressoes e Dispositivos")
+    w.geometry("460x620")
+    w.configure(bg="#1a1a2e")
+    w.resizable(False, False)
+    w.lift(); w.focus_force()
+
+    # Header
+    hf = tk.Frame(w, bg="#1a1a2e"); hf.pack(pady=(32,0))
+    icon_canvas = tk.Canvas(hf, width=56, height=56, bg="#5b8dee", highlightthickness=0)
+    icon_canvas.configure(bg="#5b8dee")
+    icon_frame = tk.Frame(hf, bg="#5b8dee", width=56, height=56)
+    icon_frame.pack()
+    icon_frame.pack_propagate(False)
+    tk.Label(icon_frame, text="[I]", bg="#5b8dee", fg="#1a1a2e",
+             font=("Segoe UI", 20, "bold")).pack(expand=True)
+
+    tk.Label(w, text="Concentrador de Impressoes", bg="#1a1a2e", fg="#cdd6f4",
+             font=("Segoe UI", 15, "bold")).pack(pady=(10,0))
+    tk.Label(w, text="e Dispositivos", bg="#1a1a2e", fg="#cdd6f4",
+             font=("Segoe UI", 15, "bold")).pack()
+    tk.Label(w, text="DELMATCH", bg="#1a1a2e", fg="#6c7086",
+             font=("Segoe UI", 8)).pack(pady=(2,16))
+
+    # Card descricao
+    cf = tk.Frame(w, bg="#25253a", padx=20, pady=14); cf.pack(fill="x", padx=24, pady=(0,12))
+    tk.Label(cf, text="Bem-vindo ao Concentrador", bg="#25253a", fg="#cdd6f4",
+             font=("Segoe UI", 12, "bold")).pack(anchor="w")
+    tk.Label(cf, text="Conecte suas impressoras e balancas ao sistema MIA em 3 passos simples.",
+             bg="#25253a", fg="#6c7086", font=("Segoe UI", 10), justify="left").pack(anchor="w", pady=(4,0))
+
+    # Passos
+    sf = tk.Frame(w, bg="#1a1a2e"); sf.pack(fill="x", padx=24, pady=(0,16))
+    passos = [
+        ("1", "Cole o Token de API", "gerado no painel MIA do restaurante"),
+        ("2", "Conecte ao sistema",  "busca impressoras automaticamente"),
+        ("3", "Mapeie as impressoras","clique duplo para configurar cada uma"),
+    ]
+    for num, titulo, desc in passos:
+        row = tk.Frame(sf, bg="#1a1a2e"); row.pack(fill="x", pady=4)
+        nb = tk.Frame(row, bg="#5b8dee", width=24, height=24)
+        nb.pack(side="left", padx=(0,10)); nb.pack_propagate(False)
+        tk.Label(nb, text=num, bg="#5b8dee", fg="#1a1a2e",
+                 font=("Segoe UI", 10, "bold")).pack(expand=True)
+        tf = tk.Frame(row, bg="#1a1a2e"); tf.pack(side="left", fill="x", expand=True)
+        tk.Label(tf, text=titulo, bg="#1a1a2e", fg="#cdd6f4",
+                 font=("Segoe UI", 10, "bold")).pack(anchor="w")
+        tk.Label(tf, text=desc, bg="#1a1a2e", fg="#6c7086",
+                 font=("Segoe UI", 9)).pack(anchor="w")
+
+    # Input token
+    tk.Label(w, text="Token de API", bg="#1a1a2e", fg="#a6adc8",
+             font=("Segoe UI", 10)).pack(anchor="w", padx=24)
+    token_var = tk.StringVar()
+    te = tk.Entry(w, textvariable=token_var, show="*", bg="#0d0d1a", fg="#cdd6f4",
+                  insertbackground="#cdd6f4", font=("Segoe UI", 11),
+                  relief="flat", highlightthickness=1, highlightbackground="#313244",
+                  highlightcolor="#5b8dee")
+    te.pack(fill="x", padx=24, pady=(6,16), ipady=8)
+
+    status_var = tk.StringVar(value="")
+    status_lbl = tk.Label(w, textvariable=status_var, bg="#1a1a2e", fg="#f38ba8",
+                          font=("Segoe UI", 9), wraplength=380)
+    status_lbl.pack(pady=(0,4))
+
+    def conectar():
+        token = token_var.get().strip()
+        if not token:
+            status_var.set("Cole o Token de API para continuar.")
+            return
+        status_var.set("Conectando ao sistema...")
+        status_lbl.config(fg="#f9e2af"); w.update()
+        r = autoconfigurar(token)
+        if r.get("ok"):
+            d = r["data"]
+            cfg.update({"token": token,
+                        "restaurant_id": d.get("restaurant_id",""),
+                        "restaurant_name": d.get("restaurant_name",""),
+                        "ultima_sincronizacao": time.strftime("%d/%m/%Y %H:%M:%S")})
+            printers = d.get("config",{}).get("printers", d.get("printers", []))
+            iw = listar_impressoras_windows()
+            imps = []
+            for p in printers:
+                ns = p.get("name",""); ts = p.get("printer_type","receipt")
+                area = {"receipt":"caixa","kitchen":"cozinha","bar":"bar"}.get(ts,"caixa")
+                match = next((x for x in iw if ns.upper()[:5] in x.upper() or x.upper()[:5] in ns.upper()),"")
+                imps.append({"nome":ns,"area":area,"printer_type":ts,"nome_impressora":match,"tipo":"comum_win32","modo":"texto"})
+            cfg["impressoras"] = imps
+            salvar_config(cfg)
+            status_var.set(f"Conectado: {d.get('restaurant_name','')}!")
+            status_lbl.config(fg="#a6e3a1")
+            w.after(1500, lambda: (w.destroy(), abrir_config()))
+        else:
+            status_var.set(f"Erro: {r.get('erro','Token invalido')}")
+            status_lbl.config(fg="#f38ba8")
+
+    btn = tk.Button(w, text="Conectar ao Sistema", command=conectar,
+                    bg="#5b8dee", fg="#1a1a2e", font=("Segoe UI", 11, "bold"),
+                    relief="flat", cursor="hand2", padx=20, pady=10)
+    btn.pack(fill="x", padx=24, pady=(0,8))
+    te.bind("<Return>", lambda e: conectar())
+
+    tk.Label(w, text="Concentrador de Impressoes e Dispositivos  .  Delmatch  .  v3.6",
+             bg="#1a1a2e", fg="#45475a", font=("Segoe UI", 8)).pack(pady=(4,16))
+
+
+
+def abrir_dashboard():
+    w = tk.Toplevel(_root)
+    w.title("Status - Concentrador")
+    w.geometry("400x480")
+    w.configure(bg="#1a1a2e")
+    w.resizable(False, False)
+    w.lift(); w.focus_force()
+
+    tk.Label(w, text="Concentrador de Impressoes",
+             bg="#1a1a2e", fg="#cdd6f4", font=("Segoe UI",13,"bold")).pack(pady=(20,2))
+    tk.Label(w, text="e Dispositivos", bg="#1a1a2e", fg="#cdd6f4",
+             font=("Segoe UI",13,"bold")).pack()
+
+    # Cards de stats
+    cards_frame = tk.Frame(w, bg="#1a1a2e"); cards_frame.pack(fill="x", padx=20, pady=16)
+    cards_frame.columnconfigure(0, weight=1); cards_frame.columnconfigure(1, weight=1)
+
+    def make_card(parent, row, col, label, value_var, cor):
+        f = tk.Frame(parent, bg="#25253a", padx=14, pady=12)
+        f.grid(row=row, column=col, padx=5, pady=5, sticky="nsew")
+        tk.Label(f, text=label, bg="#25253a", fg="#6c7086", font=("Segoe UI",9)).pack(anchor="w")
+        tk.Label(f, textvariable=value_var, bg="#25253a", fg=cor,
+                 font=("Segoe UI",20,"bold")).pack(anchor="w", pady=(2,0))
+        return f
+
+    v_total  = tk.StringVar(value="0")
+    v_hoje   = tk.StringVar(value="0")
+    v_erros  = tk.StringVar(value="0")
+    v_uptime = tk.StringVar(value="0m")
+    v_status = tk.StringVar(value="Ativo")
+
+    make_card(cards_frame, 0, 0, "Total impressos",  v_total,  "#a6e3a1")
+    make_card(cards_frame, 0, 1, "Hoje",             v_hoje,   "#89b4fa")
+    make_card(cards_frame, 1, 0, "Erros",            v_erros,  "#f38ba8")
+    make_card(cards_frame, 1, 1, "Uptime",           v_uptime, "#cba6f7")
+
+    # Ultimo job
+    uf = tk.Frame(w, bg="#25253a", padx=16, pady=12); uf.pack(fill="x", padx=20, pady=(0,8))
+    tk.Label(uf, text="Ultimo job impresso", bg="#25253a", fg="#6c7086",
+             font=("Segoe UI",9)).pack(anchor="w")
+    v_ujob = tk.StringVar(value="Nenhum ainda")
+    tk.Label(uf, textvariable=v_ujob, bg="#25253a", fg="#cdd6f4",
+             font=("Segoe UI",10)).pack(anchor="w", pady=(2,0))
+    v_uimp = tk.StringVar(value="")
+    tk.Label(uf, textvariable=v_uimp, bg="#25253a", fg="#6c7086",
+             font=("Segoe UI",9)).pack(anchor="w")
+
+    # Ultimo erro
+    ef2 = tk.Frame(w, bg="#25253a", padx=16, pady=12); ef2.pack(fill="x", padx=20, pady=(0,8))
+    tk.Label(ef2, text="Ultimo erro", bg="#25253a", fg="#6c7086",
+             font=("Segoe UI",9)).pack(anchor="w")
+    v_uerr = tk.StringVar(value="Nenhum")
+    tk.Label(ef2, textvariable=v_uerr, bg="#25253a", fg="#f38ba8",
+             font=("Segoe UI",9), wraplength=340, justify="left").pack(anchor="w", pady=(2,0))
+
+    # Painel de balancas
+    pf = tk.Frame(w, bg="#25253a", padx=16, pady=10); pf.pack(fill="x", padx=20, pady=(0,8))
+    tk.Label(pf, text="Balancas em tempo real", bg="#25253a", fg="#6c7086", font=("Segoe UI",9)).pack(anchor="w")
+    pesos_frame = tk.Frame(pf, bg="#25253a"); pesos_frame.pack(fill="x", pady=(6,0))
+
+    def atualizar_pesos():
+        if not w.winfo_exists(): return
+        for wid in pesos_frame.winfo_children(): wid.destroy()
+        if not _pesos_atuais:
+            tk.Label(pesos_frame, text="Nenhuma balanca conectada", bg="#25253a", fg="#45475a", font=("Segoe UI",9)).pack(anchor="w")
+        else:
+            for nome_b, info in _pesos_atuais.items():
+                row = tk.Frame(pesos_frame, bg="#25253a"); row.pack(fill="x", pady=2)
+                cor = "#a6e3a1" if info["status"] == "ok" else "#f38ba8"
+                tk.Label(row, text=f"{nome_b}:", bg="#25253a", fg="#cdd6f4", font=("Segoe UI",9,"bold"), width=18, anchor="w").pack(side="left")
+                tk.Label(row, text=f"{info['peso']:.3f} kg", bg="#25253a", fg=cor, font=("Segoe UI",13,"bold")).pack(side="left", padx=8)
+                tk.Label(row, text=info["hora"], bg="#25253a", fg="#45475a", font=("Segoe UI",8)).pack(side="left")
+        w.after(500, atualizar_pesos)
+    atualizar_pesos()
+
+    # Botoes
+    bf = tk.Frame(w, bg="#1a1a2e"); bf.pack(fill="x", padx=20, pady=8)
+    tk.Button(bf, text="Configuracoes", command=abrir_config,
+              bg="#313244", fg="#cdd6f4", font=("Segoe UI",9,"bold"),
+              relief="flat", padx=12, pady=6, cursor="hand2").pack(side="left", padx=4)
+    tk.Button(bf, text="Ver Log", command=abrir_log,
+              bg="#313244", fg="#cdd6f4", font=("Segoe UI",9,"bold"),
+              relief="flat", padx=12, pady=6, cursor="hand2").pack(side="left", padx=4)
+    tk.Button(bf, text="Fechar", command=w.destroy,
+              bg="#313244", fg="#cdd6f4", font=("Segoe UI",9,"bold"),
+              relief="flat", padx=12, pady=6, cursor="hand2").pack(side="right", padx=4)
+
+    # Historico de jobs
+    hf = tk.Frame(w, bg="#25253a", padx=16, pady=12); hf.pack(fill="x", padx=20, pady=(0,8))
+    tk.Label(hf, text="Historico de impressoes", bg="#25253a", fg="#6c7086",
+             font=("Segoe UI",9)).pack(anchor="w")
+    hist_frame = tk.Frame(hf, bg="#25253a"); hist_frame.pack(fill="x", pady=(6,0))
+
+    cols_h = ("hora","tipo","impressora","pedido")
+    tree_h = ttk.Treeview(hist_frame, columns=cols_h, show="headings", height=6)
+    tree_h.heading("hora",      text="Hora");      tree_h.column("hora",      width=70)
+    tree_h.heading("tipo",      text="Tipo");      tree_h.column("tipo",      width=70)
+    tree_h.heading("impressora",text="Impressora");tree_h.column("impressora",width=160)
+    tree_h.heading("pedido",    text="Pedido");    tree_h.column("pedido",    width=80)
+    sb_h = ttk.Scrollbar(hist_frame, orient="vertical", command=tree_h.yview)
+    tree_h.configure(yscrollcommand=sb_h.set)
+    tree_h.pack(side="left", fill="both", expand=True)
+    sb_h.pack(side="right", fill="y")
+
+    def reimprimir():
+        sel = tree_h.selection()
+        if not sel:
+            messagebox.showwarning("Aviso","Selecione um job na lista!",parent=w)
+            return
+        vals = tree_h.item(sel[0],"values")
+        idx = tree_h.index(sel[0])
+        if idx < len(_stats["historico"]):
+            job_info = _stats["historico"][idx]
+            jid = job_info.get("job_id","")
+            nome_imp = job_info.get("impressora","")
+            if not nome_imp:
+                messagebox.showerror("Erro","Impressora nao encontrada no historico.",parent=w)
+                return
+            # Busca o job no Supabase e reimprime
+            def _do_reimp():
+                try:
+                    resp, s = _post(
+                        f"{SUPABASE_URL}/functions/v1/agente-get-order",
+                        {"job_id": jid}, cfg.get("token","")
+                    )
+                    if s == 200 and resp:
+                        texto = _fmt(resp, job_info.get("tipo","order"), job_info.get("tipo","receipt"))
+                        r = _imprimir_raw(nome_imp, texto)
+                        if r.get("ok"):
+                            log.info(f"[REIMP] Job {jid} reimpresso em {nome_imp}")
+                            w.after(0, lambda: messagebox.showinfo("OK", f"Reimpresso em:\n{nome_imp}", parent=w))
+                        else:
+                            w.after(0, lambda: messagebox.showerror("Erro", r.get("erro",""), parent=w))
+                    else:
+                        w.after(0, lambda: messagebox.showerror("Erro","Nao foi possivel buscar o job.",parent=w))
+                except Exception as e:
+                    w.after(0, lambda: messagebox.showerror("Erro", str(e), parent=w))
+            threading.Thread(target=_do_reimp, daemon=True).start()
+
+    tk.Button(hf, text="Reimprimir selecionado", command=reimprimir,
+              bg="#cba6f7", fg="#1e1e2e", font=("Segoe UI",9,"bold"),
+              relief="flat", padx=12, pady=5, cursor="hand2").pack(anchor="w", pady=(8,0))
+
+    def atualizar():
+        if not w.winfo_exists(): return
+        v_total.set(str(_stats["total_impressos"]))
+        v_erros.set(str(_stats["erros"]))
+        mins = int((time.time() - _start_time) / 60)
+        v_uptime.set(f"{mins}m" if mins < 60 else f"{mins//60}h {mins%60}m")
+        online = "Ativo" if "Ativo" in status_poll else "Desconectado"
+        v_status.set(online)
+        if _stats["ultimo_job"]:
+            v_ujob.set(f"Impresso as {_stats['ultimo_job']}")
+            v_uimp.set(f"Impressora: {_stats['ultima_impressora']}")
+        if _stats["ultimo_erro"]:
+            v_uerr.set(_stats["ultimo_erro"][:120])
+        # Atualiza card hoje
+        v_total.set(str(_stats["total_impressos"]))
+        v_hoje.set(str(_stats["hoje"]))
+        # Atualiza historico
+        tree_h.delete(*tree_h.get_children())
+        for h in _stats["historico"]:
+            tree_h.insert("",tk.END,values=(
+                h.get("hora",""),
+                h.get("tipo",""),
+                h.get("impressora","")[:25],
+                h.get("content_ref","")
+            ))
+        w.after(2000, atualizar)
+
+    atualizar()
+
+
+def abrir_log():
+    w=tk.Toplevel(_root); w.title("Log"); w.geometry("820x500"); w.configure(bg="#1e1e2e")
+    txt=scrolledtext.ScrolledText(w,bg="#1e1e2e",fg="#a6e3a1",font=("Consolas",9),state="disabled")
+    txt.pack(fill="both",expand=True,padx=10,pady=10)
+    def upd():
+        if LOG_PATH.exists():
+            ll=LOG_PATH.read_text(encoding="utf-8",errors="replace").splitlines()
+            txt.config(state="normal"); txt.delete("1.0","end")
+            txt.insert("end","\n".join(ll[-300:])); txt.see("end"); txt.config(state="disabled")
+        w.after(2000,upd)
+    def clr():
+        if messagebox.askyesno("Limpar","Deseja limpar?",parent=w):
+            LOG_PATH.write_text("",encoding="utf-8"); upd()
+    row=tk.Frame(w,bg="#1e1e2e"); row.pack(fill="x",padx=10,pady=5)
+    for tb,cb,cor in [("Atualizar",upd,"#89b4fa"),("Limpar",clr,"#f38ba8"),
+                       ("Abrir",lambda:os.startfile(str(LOG_PATH)),"#a6e3a1")]:
+        tk.Button(row,text=tb,command=cb,bg=cor,fg="#1e1e2e",font=("Segoe UI",9,"bold"),
+                  relief="flat",padx=10,pady=5).pack(side="left",padx=4)
+    upd()
+
+def abrir_config():
+    global cfg
+    cfg=carregar_config(); iw=listar_impressoras_windows(); ps=listar_portas_serial()
+    w=tk.Toplevel(_root); w.title("Concentrador de Impressoes e Dispositivos")
+    w.geometry("820x700"); w.configure(bg="#1e1e2e"); w.lift(); w.focus_force()
+
+    sty=ttk.Style(w); sty.theme_use("clam")
+    sty.configure("TNotebook",background="#1e1e2e",borderwidth=0)
+    sty.configure("TNotebook.Tab",background="#313244",foreground="white",padding=[12,6])
+    sty.map("TNotebook.Tab",background=[("selected","#89b4fa")])
+    sty.configure("TFrame",background="#1e1e2e")
+    sty.configure("TLabel",background="#1e1e2e",foreground="#cdd6f4")
+    sty.configure("TEntry",fieldbackground="#313244",foreground="white",insertcolor="white")
+    sty.configure("TCombobox",fieldbackground="#313244",foreground="white")
+    sty.configure("Treeview",background="#313244",foreground="white",fieldbackground="#313244",rowheight=28)
+    sty.configure("Treeview.Heading",background="#45475a",foreground="white",font=("Segoe UI",9,"bold"))
+    sty.map("Treeview",background=[("selected","#89b4fa")])
+
+    nb=ttk.Notebook(w); nb.pack(fill="both",expand=True,padx=10,pady=10)
+
+    # CONEXAO
+    f1=ttk.Frame(nb); nb.add(f1,text="Conexao")
+    inf=tk.Frame(f1,bg="#313244"); inf.grid(row=0,column=0,padx=15,pady=15,sticky="ew")
+    tk.Label(inf,text="Cole o Token de API gerado no sistema MIA.\nO agente se configurara automaticamente.",
+             bg="#313244",fg="#a6c8e0",font=("Segoe UI",9),pady=8,justify="center").pack()
+    ttk.Label(f1,text="Token de API:").grid(row=1,column=0,sticky="w",padx=15,pady=4)
+    tv=tk.StringVar(value=cfg.get("token","")); te=ttk.Entry(f1,textvariable=tv,width=65,show="*")
+    te.grid(row=2,column=0,padx=15,sticky="ew"); sv2=tk.StringVar(value="")
+
+    def conectar():
+        token=tv.get().strip()
+        if not token: messagebox.showwarning("Aviso","Cole o Token!",parent=w); return
+        sv2.set("Conectando..."); w.update()
+        r=autoconfigurar(token)
+        if r.get("ok"):
+            d=r["data"]
+            cfg.update({"token":token,"restaurant_id":d.get("restaurant_id",""),
+                        "restaurant_name":d.get("restaurant_name",""),
+                        "ultima_sincronizacao":time.strftime("%d/%m/%Y %H:%M:%S")})
+            printers=d.get("config",{}).get("printers", d.get("printers",[])); icfg=[]
+            for p in printers:
+                ns=p.get("name",""); ts=p.get("printer_type","receipt")
+                area={"receipt":"caixa","kitchen":"cozinha","bar":"bar"}.get(ts,"caixa")
+                match=next((x for x in iw if ns.upper()[:5] in x.upper() or x.upper()[:5] in ns.upper()),"")
+                icfg.append({"nome":ns,"area":area,"printer_type":ts,"nome_impressora":match,"tipo":"comum_win32","modo":"texto"})
+            cfg["impressoras"]=icfg; salvar_config(cfg)
+            sv2.set(f"Conectado: {d.get('restaurant_name','')}")
+            for item in ti.get_children(): ti.delete(item)
+            for imp in icfg:
+                tag="" if imp.get("nome_impressora") else "sem_map"
+                ti.insert("",tk.END,values=(imp["nome"],imp["area"],imp["nome_impressora"],imp["tipo"]),tags=(tag,))
+            messagebox.showinfo("OK",f"Restaurante: {d.get('restaurant_name','')}\nImpressoras: {len(printers)}\n\nClique DUPLO para mapear.",parent=w)
+        else:
+            sv2.set(f"Erro: {r.get('erro','')}"); messagebox.showerror("Erro",r.get("erro","Token invalido"),parent=w)
+
+    tk.Button(f1,text="Conectar ao Sistema",command=conectar,bg="#a6e3a1",fg="#1e1e2e",
+              font=("Segoe UI",11,"bold"),relief="flat",padx=20,pady=10,cursor="hand2").grid(row=5,column=0,pady=10)
+    tk.Label(f1,textvariable=sv2,bg="#1e1e2e",fg="#89b4fa",font=("Segoe UI",10,"bold")).grid(row=6,column=0)
+    rf=tk.Frame(f1,bg="#313244"); rf.grid(row=7,column=0,padx=15,pady=8,sticky="ew")
+    tk.Label(rf,text=f"Restaurante: {cfg.get('restaurant_name','Nao configurado')}",
+             bg="#313244",fg="#cdd6f4",font=("Segoe UI",10,"bold"),pady=4).pack()
+    if cfg.get("restaurant_id"):
+        tk.Label(rf,text=f"ID: {cfg.get('restaurant_id','')}",bg="#313244",fg="#6c7086",font=("Segoe UI",8)).pack()
+    tk.Label(rf,text=f"Ultima sincronizacao: {cfg.get('ultima_sincronizacao','Nunca')}",
+             bg="#313244",fg="#6c7086",font=("Segoe UI",8),pady=4).pack()
+    sf=tk.Frame(f1,bg="#313244"); sf.grid(row=8,column=0,padx=15,pady=5,sticky="ew")
+    sv_status=tk.StringVar(value=f"Status: {status_poll}")
+    cs="#a6e3a1" if "Ativo" in status_poll else "#f38ba8"
+    lbl_status=tk.Label(sf,textvariable=sv_status,bg="#313244",fg=cs,font=("Segoe UI",10,"bold"),pady=8)
+    lbl_status.pack()
+    def _atualizar_status_config():
+        sv_status.set(f"Status: {status_poll}")
+        cor="#a6e3a1" if "Ativo" in status_poll else "#f38ba8"
+        lbl_status.config(fg=cor)
+        if sf.winfo_exists(): sf.after(1000, _atualizar_status_config)
+    _atualizar_status_config()
+    ttk.Label(f1,text="Intervalo polling (s):").grid(row=9,column=0,sticky="w",padx=15,pady=8)
+    pv=tk.StringVar(value=str(cfg.get("poll_interval",3))); ttk.Entry(f1,textvariable=pv,width=8).grid(row=10,column=0,sticky="w",padx=15)
+    f1.columnconfigure(0,weight=1)
+
+    # IMPRESSORAS
+    f2=ttk.Frame(nb); nb.add(f2,text="Impressoras")
+    inf2=tk.Frame(f2,bg="#313244"); inf2.grid(row=0,column=0,columnspan=6,padx=10,pady=6,sticky="ew")
+    tk.Label(inf2,text="DUPLO CLIQUE em uma linha para editar a Impressora Windows.\nVermelho = sem mapeamento.  caixa=receipt | cozinha=kitchen | bar=bar",
+             bg="#313244",fg="#a6c8e0",font=("Segoe UI",9),pady=6,wraplength=750,justify="left").pack()
+
+    cols=("nome","area","impressora_windows","tipo")
+    ti=ttk.Treeview(f2,columns=cols,show="headings",height=9)
+    for col,lbl,cw in [("nome","Nome Sistema",140),("area","Area",80),
+                        ("impressora_windows","Impressora Windows",300),("tipo","Tipo",100)]:
+        ti.heading(col,text=lbl); ti.column(col,width=cw)
+    sbi=ttk.Scrollbar(f2,orient="vertical",command=ti.yview); ti.configure(yscrollcommand=sbi.set)
+    ti.grid(row=1,column=0,columnspan=5,padx=10,pady=5,sticky="nsew"); sbi.grid(row=1,column=5,pady=5,sticky="ns")
+    ti.tag_configure("sem_map",foreground="#f38ba8")
+    for imp in cfg.get("impressoras",[]):
+        tag="" if imp.get("nome_impressora") else "sem_map"
+        ti.insert("",tk.END,values=(imp.get("nome",""),imp.get("area",""),
+                                    imp.get("nome_impressora",""),imp.get("tipo","comum_win32")),tags=(tag,))
+
+    ef2=tk.Frame(f2,bg="#2a2a3e",relief="ridge",bd=1); ef2.grid(row=2,column=0,columnspan=6,padx=10,pady=4,sticky="ew")
+    tk.Label(ef2,text="Impressora Windows:",bg="#2a2a3e",fg="#cdd6f4",font=("Segoe UI",9,"bold")).grid(row=0,column=0,padx=10,pady=10)
+    eiw=ttk.Combobox(ef2,values=iw,width=38); eiw.grid(row=0,column=1,padx=8,pady=10)
+    lbe=tk.Label(ef2,text="<< Clique DUPLO em uma linha",bg="#2a2a3e",fg="#6c7086",font=("Segoe UI",8)); lbe.grid(row=0,column=2,padx=8)
+
+    def duplo(e):
+        sel=ti.selection()
+        if not sel: return
+        vals=ti.item(sel[0],"values"); lbe.config(text=f"Editando: {vals[0]}",fg="#89b4fa")
+        eiw.set(vals[2] if len(vals)>2 else ""); eiw.focus()
+
+    def aplicar():
+        sel=ti.selection()
+        if not sel: messagebox.showwarning("Aviso","Clique duplo em uma linha!",parent=w); return
+        nova=eiw.get().strip()
+        if not nova: messagebox.showwarning("Aviso","Selecione a Impressora Windows!",parent=w); return
+        vals=ti.item(sel[0],"values"); ti.item(sel[0],values=(vals[0],vals[1],nova,vals[3]),tags=("",))
+        lbe.config(text=f"OK: {vals[0]} -> {nova}",fg="#a6e3a1"); eiw.set("")
+        # Salva imediatamente no cfg e no disco
+        nome_sistema = vals[0]
+        for imp in cfg.get("impressoras",[]):
+            if imp.get("nome") == nome_sistema:
+                imp["nome_impressora"] = nova
+                break
+        salvar_config(cfg)
+        log.info(f"[CONFIG] Impressora '{nome_sistema}' mapeada para '{nova}'")
+
+    ti.bind("<Double-1>",duplo)
+    tk.Button(ef2,text="Aplicar",command=aplicar,bg="#89b4fa",fg="#1e1e2e",
+              font=("Segoe UI",9,"bold"),relief="flat",padx=14,pady=6,cursor="hand2").grid(row=0,column=3,padx=8)
+
+    fi2=ttk.Frame(f2); fi2.grid(row=3,column=0,columnspan=6,padx=10,pady=4,sticky="ew")
+    ttk.Label(fi2,text="Novo:").grid(row=0,column=0,padx=4,pady=6)
+    en=ttk.Entry(fi2,width=14); en.grid(row=0,column=1,padx=4)
+    ttk.Label(fi2,text="Area:").grid(row=0,column=2,padx=4)
+    ea=ttk.Combobox(fi2,values=["caixa","cozinha","bar","delivery","balcao"],width=9); ea.grid(row=0,column=3,padx=4)
+    ttk.Label(fi2,text="Impressora:").grid(row=0,column=4,padx=4)
+    ead=ttk.Combobox(fi2,values=iw,width=26); ead.grid(row=0,column=5,padx=4)
+
+    def add_i():
+        n=en.get().strip(); ww=ead.get().strip()
+        if not n or not ww: messagebox.showwarning("Aviso","Preencha Nome e Impressora!",parent=w); return
+        ti.insert("",tk.END,values=(n,ea.get().strip(),ww,"comum_win32"))
+        en.delete(0,tk.END); ead.set("")
+
+    def rem_i():
+        sel=ti.selection()
+        if sel: ti.delete(sel[0])
+
+    def tst_i():
+        sel=ti.selection()
+        if not sel: messagebox.showwarning("Aviso","Selecione uma impressora!",parent=w); return
+        nw=ti.item(sel[0],"values")[2]
+        if not nw: messagebox.showwarning("Aviso","Mapeie a Impressora Windows!\nClique DUPLO na linha.",parent=w); return
+        txt2=("="*W+"\n"+f"  {cfg.get('restaurant_name','AGENTE LOCAL')}  ".center(W)+"\n"+
+              "  TESTE DE IMPRESSAO OK!  ".center(W)+"\n"+"="*W+"\n"+
+              f"Impressora: {nw}\n"+f"Hora: {time.strftime('%d/%m/%Y %H:%M:%S')}\n"+"="*W+"\n")
+        r=_imprimir_raw(nw,txt2)
+        if r.get("ok"): messagebox.showinfo("OK",f"Teste enviado:\n{nw}",parent=w)
+        else: messagebox.showerror("Erro",r.get("erro",""),parent=w)
+
+    bi2=tk.Frame(f2,bg="#1e1e2e"); bi2.grid(row=4,column=0,columnspan=6,padx=10,pady=6,sticky="w")
+    for tb,cb,cor in [("+ Adicionar",add_i,"#a6e3a1"),("Remover",rem_i,"#f38ba8"),
+                       ("Testar Impressao",tst_i,"#cba6f7"),("Ver Log",abrir_log,"#6c7086")]:
+        tk.Button(bi2,text=tb,command=cb,bg=cor,fg="#1e1e2e",font=("Segoe UI",9,"bold"),
+                  relief="flat",padx=10,pady=5,cursor="hand2").pack(side="left",padx=4)
+    f2.columnconfigure(0,weight=1); f2.rowconfigure(1,weight=1)
+
+    # BALANCAS
+    f3=ttk.Frame(nb); nb.add(f3,text="Balancas")
+    cob=("nome","tipo","conexao","baud"); tb2=ttk.Treeview(f3,columns=cob,show="headings",height=8)
+    for col,lbl,cw in [("nome","Nome",100),("tipo","Tipo",90),("conexao","Porta/IP",260),("baud","Baud",80)]:
+        tb2.heading(col,text=lbl); tb2.column(col,width=cw)
+    sbb2=ttk.Scrollbar(f3,orient="vertical",command=tb2.yview); tb2.configure(yscrollcommand=sbb2.set)
+    tb2.grid(row=0,column=0,columnspan=5,padx=10,pady=10,sticky="nsew"); sbb2.grid(row=0,column=5,pady=10,sticky="ns")
+    for b in cfg.get("balancas",[]):
+        con=f"{b.get('host','')}:{b.get('porta',8008)}" if b.get("tipo")=="tcp" else b.get("porta_com","")
+        tb2.insert("",tk.END,values=(b.get("nome",""),b.get("tipo","serial"),con,b.get("baud",9600)))
+    fb3=ttk.Frame(f3); fb3.grid(row=1,column=0,columnspan=6,padx=10,sticky="ew")
+    ttk.Label(fb3,text="Nome:").grid(row=0,column=0,padx=4,pady=6)
+    ebn=ttk.Entry(fb3,width=10); ebn.grid(row=0,column=1,padx=4)
+    ttk.Label(fb3,text="Tipo:").grid(row=0,column=2,padx=4)
+    ebt=ttk.Combobox(fb3,values=["serial","tcp","auto"],width=8); ebt.set("serial"); ebt.grid(row=0,column=3,padx=4)
+    ttk.Label(fb3,text="Porta/IP:").grid(row=0,column=4,padx=4)
+    ebc=ttk.Combobox(fb3,values=ps,width=20); ebc.grid(row=0,column=5,padx=4)
+    ttk.Label(fb3,text="Baud:").grid(row=0,column=6,padx=4)
+    ebb=ttk.Combobox(fb3,values=["4800","9600","19200","38400","115200"],width=8); ebb.set("4800"); ebb.grid(row=0,column=7,padx=4)
+    def add_b():
+        n=ebn.get().strip(); c=ebc.get().strip()
+        if not n or not c: messagebox.showwarning("Aviso","Preencha Nome e Porta/IP!",parent=w); return
+        tb2.insert("",tk.END,values=(n,ebt.get().strip(),c,ebb.get().strip()))
+        ebn.delete(0,tk.END); ebc.set("")
+    def rem_b():
+        sel=tb2.selection()
+        if sel: tb2.delete(sel[0])
+    bb3=tk.Frame(f3,bg="#1e1e2e"); bb3.grid(row=2,column=0,columnspan=6,padx=10,pady=6,sticky="w")
+    for tb,cb,cor in [("+ Adicionar",add_b,"#a6e3a1"),("Remover",rem_b,"#f38ba8")]:
+        tk.Button(bb3,text=tb,command=cb,bg=cor,fg="#1e1e2e",font=("Segoe UI",9,"bold"),
+                  relief="flat",padx=10,pady=5,cursor="hand2").pack(side="left",padx=4)
+
+    # Painel de teste de balanca
+    tf3=tk.Frame(f3,bg="#25253a",relief="ridge",bd=1)
+    tf3.grid(row=3,column=0,columnspan=6,padx=10,pady=(4,0),sticky="ew")
+    tk.Label(tf3,text="Teste de Balanca",bg="#25253a",fg="#cdd6f4",
+             font=("Segoe UI",9,"bold")).grid(row=0,column=0,padx=12,pady=(8,4),sticky="w")
+
+    # Linha de controles
+    ctrl=tk.Frame(tf3,bg="#25253a"); ctrl.grid(row=1,column=0,columnspan=6,padx=8,pady=4,sticky="ew")
+    tk.Label(ctrl,text="Porta:",bg="#25253a",fg="#a6adc8",font=("Segoe UI",9)).pack(side="left",padx=(4,2))
+    porta_test=ttk.Combobox(ctrl,values=ps+["COM1","COM2","COM3","COM4","COM5","COM6","COM7","COM8","COM9"],width=8)
+    if ps: porta_test.set(ps[0])
+    else:  porta_test.set("COM8")
+    porta_test.pack(side="left",padx=2)
+    tk.Label(ctrl,text="Baud:",bg="#25253a",fg="#a6adc8",font=("Segoe UI",9)).pack(side="left",padx=(8,2))
+    baud_test=ttk.Combobox(ctrl,values=["4800","9600","19200","2400","38400"],width=7)
+    baud_test.set("4800"); baud_test.pack(side="left",padx=2)
+    tk.Label(ctrl,text="Modo:",bg="#25253a",fg="#a6adc8",font=("Segoe UI",9)).pack(side="left",padx=(8,2))
+    modo_test=ttk.Combobox(ctrl,values=["Auto","ASCII 8N1","7E1"],width=8)
+    modo_test.set("Auto"); modo_test.pack(side="left",padx=2)
+
+    # Display do peso
+    peso_frame=tk.Frame(tf3,bg="#1a1a2e",relief="sunken",bd=2)
+    peso_frame.grid(row=2,column=0,columnspan=6,padx=12,pady=6,sticky="ew")
+    peso_var=tk.StringVar(value="--- kg")
+    tk.Label(peso_frame,textvariable=peso_var,bg="#1a1a2e",fg="#a6e3a1",
+             font=("Segoe UI",22,"bold")).pack(side="left",padx=16,pady=8)
+    status_var2=tk.StringVar(value="Aguardando...")
+    status_lbl2=tk.Label(peso_frame,textvariable=status_var2,bg="#1a1a2e",fg="#6c7086",
+                          font=("Segoe UI",9))
+    status_lbl2.pack(side="left",padx=8)
+    leituras_var=tk.StringVar(value="Leituras: 0")
+    tk.Label(peso_frame,textvariable=leituras_var,bg="#1a1a2e",fg="#45475a",
+             font=("Segoe UI",8)).pack(side="right",padx=12)
+
+    # Log de leituras
+    log_frame=tk.Frame(tf3,bg="#0d0d1a"); log_frame.grid(row=3,column=0,columnspan=6,padx=12,pady=(0,8),sticky="ew")
+    log_b=tk.Text(log_frame,bg="#0d0d1a",fg="#a6e3a1",font=("Consolas",8),
+                  height=4,relief="flat",state="disabled",wrap="word")
+    log_b.pack(fill="x",padx=2,pady=2)
+
+    _teste_ativo=[False]
+    _serial_obj=[None]
+    _leituras=[0]
+
+    def log_b_add(msg, cor="#a6e3a1"):
+        log_b.config(state="normal")
+        log_b.insert("end",f"{msg}\n")
+        log_b.see("end")
+        log_b.config(state="disabled")
+
+    def iniciar_teste():
+        import serial, re, threading
+        porta=porta_test.get().strip()
+        baud=int(baud_test.get().strip())
+        modo=modo_test.get()
+        if not porta:
+            messagebox.showwarning("Aviso","Selecione a porta!",parent=w); return
+        if _teste_ativo[0]:
+            _teste_ativo[0]=False
+            if _serial_obj[0]:
+                try: _serial_obj[0].close()
+                except: pass
+            btn_teste.config(text="Iniciar Teste",bg="#5b8dee")
+            status_var2.set("Parado")
+            return
+
+        _teste_ativo[0]=True
+        _leituras[0]=0
+        btn_teste.config(text="Parar Teste",bg="#f38ba8")
+        log_b_add(f"Conectando {porta} @ {baud} baud modo={modo}...")
+
+        def _run():
+            import re
+            modos_tentar=[]
+            if modo=="Auto":
+                modos_tentar=[
+                    (4800,8,"N",1,"ascii"),
+                    (9600,8,"N",1,"ascii"),
+                    (9600,7,"E",1,"7e1"),
+                    (4800,7,"E",1,"7e1"),
+                ]
+            elif modo=="ASCII 8N1":
+                modos_tentar=[(baud,8,"N",1,"ascii")]
+            else:
+                modos_tentar=[(baud,7,"E",1,"7e1")]
+
+            s=None
+            for bd,bs,par,sb,tipo in modos_tentar:
+                try:
+                    s=serial.Serial(porta,baudrate=bd,bytesize=bs,
+                                    parity=par,stopbits=sb,timeout=1)
+                    import time; time.sleep(0.3); s.flushInput()
+                    dados=s.read(32)
+                    if dados:
+                        _serial_obj[0]=s
+                        w.after(0,lambda bd=bd,tipo=tipo: (
+                            log_b_add(f"Conectado! {bd} baud {tipo}"),
+                            status_var2.set(f"Conectado {bd}b")
+                        ))
+                        break
+                    s.close(); s=None
+                except Exception as e:
+                    w.after(0,lambda e=e: log_b_add(f"Erro: {e}","#f38ba8"))
+                    if s:
+                        try: s.close()
+                        except: pass
+                    s=None
+
+            if not s:
+                w.after(0,lambda: (
+                    log_b_add("Nao foi possivel conectar!","#f38ba8"),
+                    status_var2.set("Erro de conexao"),
+                    btn_teste.config(text="Iniciar Teste",bg="#5b8dee")
+                ))
+                _teste_ativo[0]=False
+                return
+
+            buf=b""
+            import time
+            while _teste_ativo[0]:
+                try:
+                    chunk=s.read(32)
+                    if not chunk: continue
+                    buf+=chunk
+                    if len(buf)>512: buf=buf[-256:]
+                    # Tenta ler peso
+                    texto=buf.decode("ascii",errors="ignore")
+                    matches=re.findall(r"([0-9 ]{2}[.,][0-9]{3})",texto)
+                    if not matches:
+                        matches=re.findall(r"(\d{1,3}[.,]\d{3})",texto)
+                    if matches:
+                        peso_str=matches[-1].strip().replace(",",".")
+                        try:
+                            peso=float(peso_str)
+                            if 0<=peso<=500:
+                                _leituras[0]+=1
+                                n=_leituras[0]
+                                w.after(0,lambda p=peso,n=n: (
+                                    peso_var.set(f"{p:.3f} kg"),
+                                    leituras_var.set(f"Leituras: {n}"),
+                                    status_var2.set("Lendo..."),
+                                    status_lbl2.config(fg="#a6e3a1")
+                                ))
+                                buf=b""
+                        except: pass
+                except Exception as e:
+                    if _teste_ativo[0]:
+                        w.after(0,lambda e=e: (
+                            log_b_add(f"Erro leitura: {e}","#f38ba8"),
+                            status_var2.set("Erro")
+                        ))
+                    break
+
+            try: s.close()
+            except: pass
+            _serial_obj[0]=None
+
+        threading.Thread(target=_run,daemon=True).start()
+
+    def escanear_auto():
+        import serial.tools.list_ports, threading
+        log_b_add("Escaneando portas COM...")
+        def _scan():
+            portas_encontradas=[]
+            try:
+                for p in serial.tools.list_ports.comports():
+                    portas_encontradas.append(p.device)
+            except: pass
+            if portas_encontradas:
+                w.after(0,lambda: (
+                    porta_test.config(values=portas_encontradas),
+                    porta_test.set(portas_encontradas[0]),
+                    log_b_add(f"Portas: {portas_encontradas}"),
+                ))
+            else:
+                w.after(0,lambda: log_b_add("Nenhuma porta COM encontrada","#f38ba8"))
+        threading.Thread(target=_scan,daemon=True).start()
+
+    # Botoes de teste
+    bb_test=tk.Frame(tf3,bg="#25253a"); bb_test.grid(row=4,column=0,columnspan=6,padx=8,pady=(0,8),sticky="w")
+    btn_teste=tk.Button(bb_test,text="Iniciar Teste",command=iniciar_teste,
+                        bg="#5b8dee",fg="#1e1e2e",font=("Segoe UI",9,"bold"),
+                        relief="flat",padx=12,pady=6,cursor="hand2")
+    btn_teste.pack(side="left",padx=4)
+    tk.Button(bb_test,text="Escanear Portas",command=escanear_auto,
+              bg="#313244",fg="#cdd6f4",font=("Segoe UI",9,"bold"),
+              relief="flat",padx=10,pady=6,cursor="hand2").pack(side="left",padx=4)
+    tk.Button(bb_test,text="Usar esta config",
+              command=lambda: (
+                  ebc.set(porta_test.get()),
+                  ebb.set(baud_test.get()),
+                  log_b_add(f"Config aplicada: {porta_test.get()} @ {baud_test.get()}")
+              ),
+              bg="#a6e3a1",fg="#1e1e2e",font=("Segoe UI",9,"bold"),
+              relief="flat",padx=10,pady=6,cursor="hand2").pack(side="left",padx=4)
+
+    f3.columnconfigure(0,weight=1); f3.rowconfigure(0,weight=1)
+
+    # SELFCHECKOUT
+    f_sco=ttk.Frame(nb); nb.add(f_sco,text="Selfcheckout")
+
+    tk.Label(f_sco,text="Configuracao do Selfcheckout por Balanca",
+             font=("Segoe UI",10,"bold"),bg="#1e1e2e",fg="#5b8dee").grid(
+             row=0,column=0,columnspan=4,padx=12,pady=(12,4),sticky="w")
+
+    tk.Label(f_sco,text="Ativa automaticamente a impressao quando peso estavel detectado.",
+             font=("Segoe UI",8),bg="#1e1e2e",fg="#6c7086").grid(
+             row=1,column=0,columnspan=4,padx=12,pady=(0,8),sticky="w")
+
+    # Campos de config
+    campos_sco=[
+        ("Porta COM:",    "sco_porta",    "COM8",  14),
+        ("Baud Rate:",    "sco_baud",     "4800",  10),
+        ("Tara (kg):",    "sco_tara",     "0.000", 10),
+        ("Peso minimo (kg):","sco_min",   "0.050", 10),
+        ("Estabilidade (s):","sco_estab", "1.5",   10),
+        ("Cooldown (s):", "sco_cool",     "3.0",   10),
+        ("Impressora:",   "sco_imp",      "",      20),
+    ]
+    sco_vars={}
+    for row,(label,key,default,width) in enumerate(campos_sco):
+        tk.Label(f_sco,text=label,bg="#1e1e2e",fg="#a6adc8",
+                 font=("Segoe UI",9)).grid(row=row+2,column=0,padx=(12,4),pady=3,sticky="e")
+        val=cfg.get("selfcheckout",{}).get(key,default)
+        var=tk.StringVar(value=str(val))
+        sco_vars[key]=var
+        if key=="sco_imp":
+            cb=ttk.Combobox(f_sco,textvariable=var,
+                           values=[i.get("nome_impressora","") for i in cfg.get("impressoras",[]) if i.get("nome_impressora")],
+                           width=width)
+            cb.grid(row=row+2,column=1,padx=4,pady=3,sticky="w")
+        elif key=="sco_porta":
+            cb=ttk.Combobox(f_sco,textvariable=var,
+                           values=ps+["COM8","COM9","COM1","COM2","COM3"],width=width)
+            cb.grid(row=row+2,column=1,padx=4,pady=3,sticky="w")
+        else:
+            ttk.Entry(f_sco,textvariable=var,width=width).grid(
+                row=row+2,column=1,padx=4,pady=3,sticky="w")
+
+    # Toggle ativo
+    sco_ativo_var=tk.BooleanVar(value=cfg.get("selfcheckout",{}).get("ativo",False))
+    tk.Checkbutton(f_sco,text="Selfcheckout ATIVO",variable=sco_ativo_var,
+                   bg="#1e1e2e",fg="#cdd6f4",selectcolor="#313244",
+                   font=("Segoe UI",10,"bold"),activebackground="#1e1e2e").grid(
+                   row=9,column=0,columnspan=2,padx=12,pady=8,sticky="w")
+
+    # Status em tempo real
+    sco_status_frame=tk.Frame(f_sco,bg="#25253a"); sco_status_frame.grid(
+        row=10,column=0,columnspan=4,padx=12,pady=4,sticky="ew")
+    sco_peso_var=tk.StringVar(value="--- kg")
+    sco_estado_var=tk.StringVar(value="Parado")
+    sco_total_var=tk.StringVar(value="0 impressoes")
+    tk.Label(sco_status_frame,textvariable=sco_peso_var,bg="#25253a",fg="#a6e3a1",
+             font=("Segoe UI",18,"bold")).pack(side="left",padx=12,pady=8)
+    tk.Label(sco_status_frame,textvariable=sco_estado_var,bg="#25253a",fg="#f9e2af",
+             font=("Segoe UI",10)).pack(side="left",padx=8)
+    tk.Label(sco_status_frame,textvariable=sco_total_var,bg="#25253a",fg="#45475a",
+             font=("Segoe UI",9)).pack(side="right",padx=12)
+
+    def _sco_status_cb(estado,peso,msg):
+        estados={
+            "aguardando": "Aguardando prato...",
+            "pesando":    "Pesando...",
+            "estavel":    "Peso estavel!",
+            "imprimindo": "Imprimindo...",
+            "cooldown":   "Retire o prato",
+            "reconectando":"Reconectando...",
+            "erro":       "Erro de conexao",
+        }
+        cores={
+            "aguardando": "#6c7086",
+            "pesando":    "#f9e2af",
+            "estavel":    "#a6e3a1",
+            "imprimindo": "#5b8dee",
+            "cooldown":   "#fab387",
+            "reconectando":"#f9e2af",
+            "erro":       "#f38ba8",
+        }
+        try:
+            sco_peso_var.set(f"{peso:.3f} kg")
+            sco_estado_var.set(estados.get(estado,estado))
+            if HAS_SCO and mod_sco.get_selfcheckout():
+                sco_total_var.set(f"{mod_sco.get_selfcheckout().total_impressos} impressoes")
+        except: pass
+
+    def btn_tarar():
+        if HAS_SCO and mod_sco.get_selfcheckout():
+            tara=mod_sco.get_selfcheckout().tarar_agora()
+            sco_vars["sco_tara"].set(f"{tara:.3f}")
+            messagebox.showinfo("Tara",f"Tara definida: {tara:.3f} kg",parent=w)
+        else:
+            messagebox.showwarning("Aviso","Selfcheckout nao esta ativo!",parent=w)
+
+    bb_sco=tk.Frame(f_sco,bg="#1e1e2e"); bb_sco.grid(
+        row=11,column=0,columnspan=4,padx=12,pady=6,sticky="w")
+    tk.Button(bb_sco,text="Tarar agora (peso atual = tara)",command=btn_tarar,
+              bg="#f9e2af",fg="#1e1e2e",font=("Segoe UI",9,"bold"),
+              relief="flat",padx=12,pady=6,cursor="hand2").pack(side="left",padx=4)
+
+    f_sco.columnconfigure(1,weight=1)
+
+    # INICIALIZACAO
+    f4=ttk.Frame(nb); nb.add(f4,text="Inicializacao")
+    def esta_st():
+        try:
+            k=winreg.OpenKey(winreg.HKEY_CURRENT_USER,r"Software\Microsoft\Windows\CurrentVersion\Run",0,winreg.KEY_READ)
+            winreg.QueryValueEx(k,"AgenteLocal"); winreg.CloseKey(k); return True
+        except: return False
+    def tog():
+        try:
+            k=winreg.OpenKey(winreg.HKEY_CURRENT_USER,r"Software\Microsoft\Windows\CurrentVersion\Run",0,winreg.KEY_SET_VALUE)
+            if esta_st():
+                winreg.DeleteValue(k,"AgenteLocal"); stb.config(text="Ativar inicio automatico")
+                messagebox.showinfo("OK","Removido!",parent=w)
+            else:
+                exe=(str(Path(sys.executable).parent/"AgenteLocal.exe") if getattr(sys,'frozen',False) else f'"{sys.executable}" "{__file__}"')
+                winreg.SetValueEx(k,"AgenteLocal",0,winreg.REG_SZ,exe); stb.config(text="Desativar inicio automatico")
+                messagebox.showinfo("OK","Iniciara com o Windows!",parent=w)
+            winreg.CloseKey(k)
+        except Exception as e: messagebox.showerror("Erro",str(e),parent=w)
+    def atl():
+        try:
+            # Tenta desktop local e OneDrive
+            desktops = [
+                Path.home()/"Desktop",
+                Path.home()/"OneDrive"/"Desktop",
+                Path(os.environ.get("USERPROFILE",""))/"Desktop",
+                Path(os.environ.get("USERPROFILE",""))/"OneDrive"/"Desktop",
+            ]
+            d = next((p for p in desktops if p.exists()), Path.home()/"Desktop")
+            script_dir = Path(__file__).resolve().parent if not getattr(sys,"frozen",False) else Path(sys.executable).parent
+            if getattr(sys,"frozen",False):
+                exe = str(Path(sys.executable).resolve())
+            else:
+                possivel = [script_dir / "dist" / "AgenteLocal.exe", script_dir / "AgenteLocal.exe"]
+                exe_path = next((p for p in possivel if p.exists()), None)
+                if exe_path:
+                    exe = str(exe_path)
+                else:
+                    messagebox.showerror("Erro", f"AgenteLocal.exe nao encontrado!\nGere o executavel primeiro.", parent=w)
+                    return
+            # Prefere OneDrive Desktop se existir
+            onedrive_desk = Path(os.environ.get("USERPROFILE","")) / "OneDrive" / "Desktop"
+            d = onedrive_desk if onedrive_desk.exists() else d
+            atalho = str(d / "Agente Local.lnk")
+            ps = f'''$ws=New-Object -ComObject WScript.Shell; $s=$ws.CreateShortcut("{atalho}"); $s.TargetPath="{exe}"; $s.WorkingDirectory="{Path(exe).parent}"; $s.Description="Agente Local MIA"; $s.Save()'''
+            r = subprocess.run(["powershell","-NoProfile","-NonInteractive","-Command", ps],
+                               capture_output=True, text=True, timeout=10)
+            if r.returncode == 0 and Path(atalho).exists():
+                messagebox.showinfo("OK", f"Atalho criado em:\n{atalho}", parent=w)
+            else:
+                messagebox.showerror("Erro", f"Nao foi possivel criar o atalho.\n{r.stderr}", parent=w)
+        except Exception as e: messagebox.showerror("Erro", str(e), parent=w)
+    tk.Label(f4,text="Inicializacao do Windows",bg="#1e1e2e",fg="#cdd6f4",font=("Segoe UI",13,"bold")).pack(pady=30)
+    ts="Desativar inicio automatico" if esta_st() else "Ativar inicio automatico"
+    stb=tk.Button(f4,text=ts,command=tog,bg="#89b4fa",fg="#1e1e2e",font=("Segoe UI",11,"bold"),
+                  relief="flat",padx=20,pady=10,cursor="hand2",width=30); stb.pack(pady=8)
+    tk.Button(f4,text="Criar atalho na Area de Trabalho",command=atl,
+              bg="#a6e3a1",fg="#1e1e2e",font=("Segoe UI",10,"bold"),relief="flat",padx=15,pady=8,cursor="hand2",width=30).pack(pady=8)
+    tk.Button(f4,text="Abrir Log",command=abrir_log,
+              bg="#fab387",fg="#1e1e2e",font=("Segoe UI",10,"bold"),relief="flat",padx=15,pady=8,cursor="hand2",width=30).pack(pady=8)
+
+    # RODAPE
+    def salvar():
+        global cfg
+        cfg["token"]=tv.get().strip(); cfg["poll_interval"]=int(pv.get().strip() or "3")
+        imps=[]
+        for item in ti.get_children():
+            v=ti.item(item,"values"); imps.append({"nome":v[0],"area":v[1],"nome_impressora":v[2],"tipo":v[3],"modo":"texto"})
+        cfg["impressoras"]=imps; bals=[]
+        for item in tb2.get_children():
+            v=tb2.item(item,"values"); n2,t2,c3,b2=v[0],v[1],v[2],v[3]
+            if t2=="tcp" and ":" in c3:
+                h2,p2=c3.split(":",1); bals.append({"nome":n2,"tipo":"tcp","host":h2,"porta":int(p2)})
+            else: bals.append({"nome":n2,"tipo":t2,"porta_com":c3,"baud":int(b2)})
+        cfg["balancas"]=bals
+        # Salva config do selfcheckout
+        sco_cfg={
+            "ativo":  sco_ativo_var.get(),
+            "sco_porta":  sco_vars["sco_porta"].get(),
+            "sco_baud":   sco_vars["sco_baud"].get(),
+            "sco_tara":   sco_vars["sco_tara"].get(),
+            "sco_min":    sco_vars["sco_min"].get(),
+            "sco_estab":  sco_vars["sco_estab"].get(),
+            "sco_cool":   sco_vars["sco_cool"].get(),
+            "sco_imp":    sco_vars["sco_imp"].get(),
+        }
+        cfg["selfcheckout"]=sco_cfg
+        # Reinicia selfcheckout se ativo
+        if HAS_SCO:
+            mod_sco.parar_selfcheckout()
+            if sco_cfg["ativo"]:
+                cfg_bal={
+                    "porta":          sco_cfg["sco_porta"],
+                    "baudrate":       int(sco_cfg["sco_baud"] or 4800),
+                    "bytesize":       8,"parity":"N","stopbits":1,
+                    "tara_kg":        float(sco_cfg["sco_tara"] or 0),
+                    "peso_minimo_kg": float(sco_cfg["sco_min"] or 0.05),
+                    "estabilidade_s": float(sco_cfg["sco_estab"] or 1.5),
+                    "cooldown_s":     float(sco_cfg["sco_cool"] or 3.0),
+                    "nome":           "Selfcheckout",
+                }
+                mod_sco.iniciar_selfcheckout(
+                    cfg_bal, SUPABASE_URL,
+                    cfg.get("token",""), cfg.get("restaurant_id",""),
+                    sco_cfg["sco_imp"], _sco_status_cb
+                )
+                log.info("[SCO] Selfcheckout iniciado apos salvar config")
+        salvar_config(cfg)
+        messagebox.showinfo("Salvo!","Configuracoes salvas!\nReinicie o agente para aplicar.",parent=w)
+        w.destroy()
+
+    rod=tk.Frame(w,bg="#181825"); rod.pack(fill="x",side="bottom")
+    tk.Button(rod,text="Salvar Configuracoes",command=salvar,bg="#89b4fa",fg="#1e1e2e",
+              font=("Segoe UI",11,"bold"),relief="flat",padx=20,pady=12,cursor="hand2").pack(side="right",padx=10,pady=8)
+    tk.Button(rod,text="Cancelar",command=w.destroy,bg="#45475a",fg="white",
+              font=("Segoe UI",10),relief="flat",padx=15,pady=12,cursor="hand2").pack(side="right",pady=8)
+    tk.Button(rod,text="Log em tempo real",command=abrir_log,bg="#fab387",fg="#1e1e2e",
+              font=("Segoe UI",10,"bold"),relief="flat",padx=15,pady=12,cursor="hand2").pack(side="left",padx=10,pady=8)
+
+def reiniciar_app():
+    log.info("Reiniciando agente...")
+    import subprocess
+    subprocess.Popen([sys.executable, __file__])
+    os._exit(0)
+
+
+
+
+VERSION = "3.6"
+GITHUB_USER  = "delmatch-user"
+GITHUB_REPO  = "agente-local-releases"
+GITHUB_TOKEN = "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"
+
+def verificar_atualizacao():
+    try:
+        import urllib.request, json, os, sys, tempfile
+        # Tenta pegar version.json
+        url = f"https://raw.githubusercontent.com/{GITHUB_USER}/{GITHUB_REPO}/main/version.json"
+        req = urllib.request.Request(url)
+        if GITHUB_TOKEN:
+            req.add_header("Authorization", f"token {GITHUB_TOKEN}")
+        
+        with urllib.request.urlopen(req, timeout=10) as r:
+            data = json.loads(r.read())
+        
+        nova = data.get("version","")
+        if nova and nova != VERSION:
+            log.info(f"[UPDATE] Nova versao disponivel: {nova} (atual: {VERSION})")
+            exe_url = data.get("url","")
+            if exe_url:
+                log.info(f"[UPDATE] Baixando {exe_url}...")
+                
+                # Handler customizado para remover Authorization em caso de redirecionamento (S3/GitHub Assets)
+                class RedirectHandler(urllib.request.HTTPRedirectHandler):
+                    def redirect_request(self, req, fp, code, msg, headers, newurl):
+                        new_req = super().redirect_request(req, fp, code, msg, headers, newurl)
+                        if "github" not in newurl.lower():
+                            if "Authorization" in new_req.headers:
+                                del new_req.headers["Authorization"]
+                        return new_req
+
+                opener = urllib.request.build_opener(RedirectHandler)
+                req_exe = urllib.request.Request(exe_url)
+                if GITHUB_TOKEN and "github.com" in exe_url:
+                    req_exe.add_header("Authorization", f"token {GITHUB_TOKEN}")
+                
+                tmp = tempfile.mktemp(suffix=".exe")
+                with opener.open(req_exe, timeout=60) as r2:
+                    with open(tmp, "wb") as f2:
+                        f2.write(r2.read())
+                
+                # Script de substituicao e reinicio
+                bat = tempfile.mktemp(suffix=".bat")
+                exe_name = "AgenteLocal.exe"
+                if getattr(sys, "frozen", False):
+                   exe_atual = os.path.join(os.path.dirname(sys.executable), exe_name)
+                else:
+                   exe_atual = os.path.join(os.getcwd(), "dist", exe_name)
+
+                with open(bat, "w") as fb:
+                    fb.write(f"@echo off\ntimeout /t 2 /nobreak >nul\nmove /y \"{tmp}\" \"{exe_atual}\"\nstart \"\" \"{exe_atual}\"\ndel \"%~f0\"\n")
+                
+                import subprocess
+                subprocess.Popen(["cmd","/c",bat], creationflags=0x08000000)
+                log.info("[UPDATE] Atualizacao aplicada! Reiniciando...")
+                os._exit(0)
+        else:
+            log.info(f"[UPDATE] Versao atual {VERSION} ja e a mais recente")
+    except Exception as e:
+        log.error(f"[UPDATE] Erro ao verificar atualizacao: {e}")
+
+async def loop_update():
+    await asyncio.sleep(30)  # aguarda 30s antes da primeira verificacao
+    while True:
+        try: verificar_atualizacao()
+        except Exception as e: log.error(f"[UPDATE] {e}")
+        await asyncio.sleep(6 * 3600)  # verifica a cada 6 horas
+
+
+
+
+
+import pystray
+from PIL import Image as PILImage
+
+def _criar_icone(icon=None):
+    img = PILImage.new("RGBA", (64,64), (0,0,0,0))
+    from PIL import ImageDraw
+    d = ImageDraw.Draw(img)
+    d.ellipse([4,4,60,60], fill="#5b8dee")
+    d.rectangle([20,18,44,46], fill="white")
+    d.rectangle([20,18,44,26], fill="#1a1a2e")
+    return img
+
+def iniciar_tray():
+    global _tray_icon
+    try:
+        img = _criar_icone()
+    except:
+        img = PILImage.new("RGBA", (64,64), "#5b8dee")
+
+    menu = pystray.Menu(
+        pystray.MenuItem(
+            "Status",
+            lambda icon, item: _gui_queue.put("dashboard"),
+            default=True
+        ),
+        pystray.MenuItem(
+            "Configuracoes",
+            lambda icon, item: _gui_queue.put("config")
+        ),
+        pystray.MenuItem(
+            "Ver Log",
+            lambda icon, item: _gui_queue.put("log")
+        ),
+        pystray.Menu.SEPARATOR,
+        pystray.MenuItem(
+            "Reiniciar",
+            lambda icon, item: _gui_queue.put("reiniciar")
+        ),
+        pystray.MenuItem(
+            "Sair",
+            lambda icon, item: _gui_queue.put("sair")
+        ),
+    )
+
+    rest = cfg.get("restaurant_name","Agente Local")
+    _tray_icon = pystray.Icon(
+        "AgenteLocal",
+        img,
+        f"Concentrador MIA - {rest}",
+        menu
+    )
+    _tray_icon.run()
+
+def _check():
+    try:
+        cmd = _gui_queue.get_nowait()
+        if   cmd == "config":    abrir_config()
+        elif cmd == "dashboard": abrir_dashboard()
+        elif cmd == "log":       abrir_log()
+        elif cmd == "reiniciar": reiniciar_app()
+        elif cmd == "sair":      os._exit(0)
+    except queue.Empty:
+        pass
+    _root.after(300, _check)
+
+if __name__ == "__main__":
+    log.info("=== Concentrador de Impressoes e Dispositivos v3.6 iniciando ===")
+
+    # Garante startup no Windows
+    _garantir_startup()
+
+    _root = tk.Tk()
+    _root.withdraw()
+    _root.title("Agente Local")
+
+    # Primeira execucao - abre boas-vindas
+    if not cfg.get("token") or not cfg.get("restaurant_id"):
+        log.info("Primeira execucao - abrindo boas-vindas")
+        abrir_boasvindas()
+        _root.mainloop()
+        _root = tk.Tk()
+        _root.withdraw()
+        cfg = carregar_config()
+
+    if not cfg.get("restaurant_id"):
+        log.error("restaurant_id nao configurado.")
+        import sys
+        sys.exit(1)
+
+    # Sincroniza impressoras do servidor ao iniciar
+    log.info("[SYNC] Sincronizando impressoras do servidor ao iniciar...")
+    try:
+        sincronizar_impressoras()
+        cfg = carregar_config()  # Recarrega apos sincronizacao
+    except Exception as e:
+        log.warning(f"[SYNC] Falha na sincronizacao inicial: {e}")
+
+    # Abre config automaticamente se nao tiver impressoras mapeadas
+    imps_mapeadas = [i for i in cfg.get("impressoras",[]) if i.get("nome_impressora")]
+    if not imps_mapeadas:
+        log.info("[APP] Sem impressoras mapeadas - abrindo configuracoes")
+        _root.after(1500, abrir_config)
+
+    log.info(f"Restaurante: {cfg.get('restaurant_name','?')}")
+    log.info(f"Impressoras: {[i.get('nome') for i in cfg.get('impressoras',[])]}")
+
+    # Inicia polling em background
+    import asyncio, threading
+
+    def _run_polling_safe():
+        while True:
+            try:
+                asyncio.run(loop_poll())
+            except Exception as e:
+                log.error(f"[POLL] Crash: {e} - reiniciando em 5s")
+                import time as _t; _t.sleep(5)
+
+    def _run_update_safe():
+        while True:
+            try:
+                asyncio.run(loop_update())
+            except Exception as e:
+                log.error(f"[UPDATE] Crash: {e}")
+                import time as _t; _t.sleep(60)
+
+    threading.Thread(target=_run_polling_safe, daemon=True).start()
+    threading.Thread(target=_run_update_safe,  daemon=True).start()
+
+    # Fecha janela = minimiza para bandeja
+    def _on_close():
+        _root.withdraw()
+    _root.protocol("WM_DELETE_WINDOW", _on_close)
+
+    _root.after(300, _check)
+
+    # Inicia systray em thread separada
+    threading.Thread(target=iniciar_tray, daemon=True).start()
+
+    # Loop principal com crash recovery
+    while True:
+        try:
+            _root.mainloop()
+            break
+        except Exception as e:
+            log.error(f"[GUI] Erro mainloop: {e} - reiniciando")
+            import time as _t; _t.sleep(1)
