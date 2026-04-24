@@ -1,5 +1,5 @@
 {
-  "version": "3.7",
-  "url": "https://github.com/delmatch-user/agente-local-releases/releases/download/v3.7/AgenteLocal.exe",
-  "notes": "Auto-update silencioso, suporte multi-rede, impressao TCP direta, correcao de bugs"
+  "version": "3.8",
+  "url": "https://github.com/delmatch-user/agente-local-releases/releases/download/v3.8/AgenteLocal.exe",
+  "notes": "Correcao de polling, multi-rede, auto-update robusto, instalador hibrido"
 }
