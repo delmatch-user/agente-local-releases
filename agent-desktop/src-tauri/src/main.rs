@@ -92,10 +92,10 @@ async fn start_polling(
     let supabase_key = config.supabase_key.clone().unwrap_or_default();
     let api_url = config.api_url.clone();
     let db = state.db.clone();
-    
+
     drop(config);
-    
-    let polling = PollingService::new(token, supabase_key, api_url, db, app_handle);
+
+    let polling = PollingService::new(token, supabase_key, api_url, db, app_handle, state.config.clone());
     
     let mut polling_guard = state.polling.lock().await;
     *polling_guard = Some(polling);

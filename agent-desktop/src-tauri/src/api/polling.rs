@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 use tauri::Manager;
 use tokio::sync::Mutex;
 
+use crate::config::{AppConfig, ConnectionType};
 use crate::db::Database;
 use crate::escpos::receipt::{ReceiptContent, ReceiptFormatter};
 use crate::hardware::printer;
@@ -59,6 +60,7 @@ pub struct PollingService {
     db: Arc<Database>,
     app_handle: tauri::AppHandle,
     running: Arc<Mutex<bool>>,
+    config: Arc<Mutex<AppConfig>>,
 }
 
 impl PollingService {
@@ -68,6 +70,7 @@ impl PollingService {
         api_url: String,
         db: Arc<Database>,
         app_handle: tauri::AppHandle,
+        config: Arc<Mutex<AppConfig>>,
     ) -> Self {
         Self {
             token,
@@ -76,9 +79,10 @@ impl PollingService {
             db,
             app_handle,
             running: Arc::new(Mutex::new(false)),
+            config,
         }
     }
-    
+
     pub async fn start(&mut self) {
         let mut running = self.running.lock().await;
         if *running {
@@ -86,17 +90,18 @@ impl PollingService {
         }
         *running = true;
         drop(running);
-        
+
         let token = self.token.clone();
         let supabase_key = self.supabase_key.clone();
         let api_url = self.api_url.clone();
         let db = self.db.clone();
         let app_handle = self.app_handle.clone();
         let running = self.running.clone();
-        
+        let config = self.config.clone();
+
         tokio::spawn(async move {
             let client = reqwest::Client::new();
-            
+
             loop {
                 {
                     let is_running = running.lock().await;
@@ -104,26 +109,28 @@ impl PollingService {
                         break;
                     }
                 }
-                
+
                 match poll_once(&client, &api_url, &token, &supabase_key).await {
                     Ok(response) => {
+                        let cfg = config.lock().await.clone();
+
                         // Process print jobs
                         for job in response.print_jobs {
-                            process_print_job(&job, &db, &app_handle, &client, &api_url, &token, &supabase_key).await;
+                            process_print_job(&job, &db, &app_handle, &client, &api_url, &token, &supabase_key, &cfg).await;
                         }
-                        
+
                         // Process scale requests
                         for scale_req in &response.scale_requests {
                             if scale_req.status == "pending" || scale_req.status == "reading" {
                                 process_scale_request(scale_req, &app_handle, &client, &api_url, &token, &supabase_key, &response.config).await;
                             }
                         }
-                        
+
                         // Process commands
                         for cmd in response.commands {
-                            process_command(&cmd, &app_handle, &client, &api_url, &token, &supabase_key).await;
+                            process_command(&cmd, &app_handle, &client, &api_url, &token, &supabase_key, &cfg).await;
                         }
-                        
+
                         // Emit status update
                         let _ = app_handle.emit_all("poll_success", &response.server_time);
                     }
@@ -132,15 +139,15 @@ impl PollingService {
                         let _ = app_handle.emit_all("poll_error", e.to_string());
                     }
                 }
-                
+
                 // Sync pending offline jobs
                 sync_pending(&db, &client, &api_url, &token, &supabase_key).await;
-                
+
                 tokio::time::sleep(Duration::from_secs(5)).await;
             }
         });
     }
-    
+
     pub async fn stop(&self) {
         let mut running = self.running.lock().await;
         *running = false;
@@ -182,9 +189,28 @@ async fn process_print_job(
     api_url: &str,
     token: &str,
     supabase_key: &str,
+    cfg: &AppConfig,
 ) {
     log::info!("Processing print job: {}", job.id);
-    
+
+    let job_type = job.job_type.as_deref()
+        .or(job.printer_type.as_deref())
+        .unwrap_or("receipt");
+
+    // Find the right printer: match by printer_type, fallback to default, fallback to first
+    let printer_cfg = cfg.printers.iter()
+        .find(|p| p.printer_types.iter().any(|t| t == job_type))
+        .or_else(|| cfg.printers.iter().find(|p| p.is_default))
+        .or_else(|| cfg.printers.first());
+
+    let Some(printer_cfg) = printer_cfg else {
+        log::error!("No printer configured for job type '{}'", job_type);
+        report_job_status(client, api_url, token, supabase_key, &job.id, "failed",
+            Some("Nenhuma impressora configurada")).await;
+        let _ = app_handle.emit_all("job_failed", (&job.id, "Nenhuma impressora configurada"));
+        return;
+    };
+
     // Parse content
     let content: ReceiptContent = match serde_json::from_value(job.content.clone()) {
         Ok(c) => c,
@@ -194,11 +220,11 @@ async fn process_print_job(
             return;
         }
     };
-    
-    // Format receipt
-    let formatter = ReceiptFormatter::new(80); // TODO: get from config
-    let job_type = job.job_type.as_deref().unwrap_or("receipt");
-    
+
+    // Format receipt using paper width from printer config
+    let width = printer_cfg.paper_width.chars_per_line();
+    let formatter = ReceiptFormatter::new(width);
+
     let data = match job_type {
         "kitchen" => formatter.format_sector_receipt(&content, "COZINHA"),
         "bar" => formatter.format_sector_receipt(&content, "BAR"),
@@ -209,30 +235,41 @@ async fn process_print_job(
         }
         _ => formatter.format_customer_receipt(&content),
     };
-    
-    // Print (TODO: get printer config)
-    let result = printer::print_network(&data, "192.168.1.100").await;
-    
-    match result {
+
+    // Route to USB or network printer based on connection type
+    let result = match printer_cfg.connection_type {
+        ConnectionType::Usb => {
+            log::info!("Printing job {} via USB on {}", job.id, printer_cfg.address);
+            printer::print_usb(&data, &printer_cfg.address).await
+        }
+        ConnectionType::Network | ConnectionType::Bluetooth => {
+            log::info!("Printing job {} via network on {}", job.id, printer_cfg.address);
+            printer::print_network(&data, &printer_cfg.address).await
+        }
+    };
+
+    let (status, err_msg) = match result {
         Ok(_) => {
-            log::info!("Job {} printed successfully", job.id);
-            report_job_status(client, api_url, token, supabase_key, &job.id, "printed", None).await;
+            log::info!("Job {} printed successfully on '{}'", job.id, printer_cfg.name);
             let _ = app_handle.emit_all("job_printed", &job.id);
+            ("printed", None)
         }
         Err(e) => {
-            log::error!("Job {} failed: {}", job.id, e);
-            report_job_status(client, api_url, token, supabase_key, &job.id, "failed", Some(&e.to_string())).await;
-            let _ = app_handle.emit_all("job_failed", (&job.id, e.to_string()));
+            log::error!("Job {} failed on '{}': {}", job.id, printer_cfg.name, e);
+            let msg = e.to_string();
+            let _ = app_handle.emit_all("job_failed", (&job.id, msg.clone()));
+            ("failed", Some(msg))
         }
-    }
-    
-    // Save to local DB
+    };
+
+    report_job_status(client, api_url, token, supabase_key, &job.id, status, err_msg.as_deref()).await;
+
     let _ = db.save_job(&crate::db::PrintJobRecord {
         id: job.id.clone(),
         order_id: job.order_id.clone(),
         job_type: job_type.to_string(),
-        status: "printed".to_string(),
-        error_message: None,
+        status: status.to_string(),
+        error_message: err_msg,
         created_at: job.created_at.clone(),
         printed_at: Some(chrono::Utc::now().to_rfc3339()),
     });
@@ -245,13 +282,30 @@ async fn process_command(
     api_url: &str,
     token: &str,
     supabase_key: &str,
+    cfg: &AppConfig,
 ) {
     log::info!("Processing command: {} ({})", cmd.id, cmd.command_type);
-    
+
     match cmd.command_type.as_str() {
         "open_drawer" => {
-            // TODO: get drawer config
-            match crate::hardware::drawer::open("network", "192.168.1.100").await {
+            let (conn_type, address) = if let Some(drawer) = &cfg.drawer {
+                let ct = match drawer.connection_type {
+                    ConnectionType::Usb => "usb",
+                    _ => "network",
+                };
+                (ct, drawer.address.clone())
+            } else if let Some(printer) = cfg.printers.iter().find(|p| p.is_default).or_else(|| cfg.printers.first()) {
+                // Fall back to default printer address (drawer on same connection)
+                let ct = match printer.connection_type {
+                    ConnectionType::Usb => "usb",
+                    _ => "network",
+                };
+                (ct, printer.address.clone())
+            } else {
+                log::warn!("No drawer or printer configured for open_drawer command");
+                return;
+            };
+            match crate::hardware::drawer::open(conn_type, &address).await {
                 Ok(_) => {
                     let _ = app_handle.emit_all("drawer_opened", ());
                 }

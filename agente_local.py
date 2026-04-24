@@ -317,19 +317,62 @@ def _imprimir_raw(nome, conteudo):
             try:
                 win32print.StartDocPrinter(h,1,("Cupom",None,"RAW"))
                 win32print.StartPagePrinter(h)
-                
+
                 # Se for string, codifica. Se for bytes (RAW), envia direto.
                 if isinstance(conteudo, str):
                     win32print.WritePrinter(h,(conteudo+"\n\n\n\n\n\x1b\x64\x05\x1d\x56\x00").encode("cp850","replace"))
                 else:
                     win32print.WritePrinter(h, conteudo)
-                
+
                 win32print.EndPagePrinter(h)
                 win32print.EndDocPrinter(h)
             finally: win32print.ClosePrinter(h)
             return {"ok":True}
         return {"ok":False,"erro":"win32print indisponivel"}
     except Exception as e: return {"ok":False,"erro":str(e)}
+
+def _imprimir_tcp(endereco, conteudo):
+    """Imprime via socket TCP — para impressoras de rede sem driver Windows."""
+    import socket
+    try:
+        if ":" in endereco:
+            host, porta_str = endereco.rsplit(":", 1)
+            porta = int(porta_str)
+        else:
+            host, porta = endereco, 9100
+        with socket.create_connection((host, porta), timeout=10) as s:
+            if isinstance(conteudo, str):
+                payload = (conteudo + "\n\n\n\n\n\x1b\x64\x05\x1d\x56\x00").encode("cp850", "replace")
+            else:
+                payload = conteudo
+            s.sendall(payload)
+        return {"ok": True}
+    except Exception as e:
+        return {"ok": False, "erro": str(e)}
+
+def _res_imp_por_rede(pt, printer_id=None):
+    """Resolve impressora considerando multi-rede e fallback para config legada."""
+    redes = cfg.get("redes", [])
+    # Busca nas redes configuradas
+    for rede in redes:
+        for imp in rede.get("impressoras", []):
+            if printer_id and (imp.get("id") == printer_id or imp.get("nome") == printer_id):
+                return imp
+            if not printer_id and imp.get("printer_type") == pt:
+                return imp
+    # Fallback: config legada (impressoras na raiz)
+    nome = _res_imp(pt)
+    if nome:
+        return {"nome_impressora": nome, "tipo": "comum_win32"}
+    return None
+
+def _imprimir_com_roteamento(imp, conteudo):
+    """Roteia impressão: driver Windows (comum_win32) ou TCP direto (rede)."""
+    tipo = imp.get("tipo", "comum_win32")
+    if tipo == "rede":
+        return _imprimir_tcp(imp.get("endereco_ip", ""), conteudo)
+    else:
+        return _imprimir_raw(imp.get("nome_impressora", ""), conteudo)
 
 def _R(v):
     try: return f"R$ {int(v)/100:.2f}"
@@ -476,6 +519,7 @@ def _res_imp(pt):
 
 def proc_job(job):
     jid=job.get("id"); pt=job.get("printer_type","receipt")
+    pid=job.get("printer_id")
     content=job.get("content",{}); copies=int(job.get("copies",1)); jt=job.get("job_type","order")
     log.info(f"[PRINT] Job {jid} tipo={pt}")
     oid=content.get("order_id")
@@ -483,10 +527,12 @@ def proc_job(job):
         p=ef_get_order(oid)
         if p: content=p; log.info("[ORDER] OK")
         else: log.error(f"[ORDER] Falha {oid}")
-    nome=_res_imp(pt)
-    if not nome:
+
+    # Resolve impressora com suporte a multi-rede
+    imp = _res_imp_por_rede(pt, printer_id=pid)
+    if not imp:
         ef_update_job(jid,"failed",f"Sem impressora para '{pt}'"); return
-        
+
     # PRIORIDADE: Usa dados formatados do servidor (ESC/POS RAW) se existirem
     escpos_b64 = job.get("escpos_data")
     if escpos_b64:
@@ -495,32 +541,31 @@ def proc_job(job):
             dados_brutos = base64.b64decode(escpos_b64)
             log.info(f"[PRINT] Usando layout do sistema (RAW) para Job {jid}")
             for _ in range(copies):
-                r = _imprimir_raw(nome, dados_brutos)
+                r = _imprimir_com_roteamento(imp, dados_brutos)
                 if not r.get("ok"):
                     _stats["erros"] += 1
                     _stats["ultimo_erro"] = r.get("erro","")
-                    reportar_erro_supabase(jid, nome, r.get("erro",""), jt)
                     ef_update_job(jid, "failed", r.get("erro",""))
                     return
         except Exception as e:
             log.error(f"[PRINT] Erro ao decodificar ESC/POS do sistema: {e}")
-            # Se falhou, nao faz nada e tenta o layout local abaixo
+            # Se falhou, tenta o layout local abaixo
     else:
         # FALLBACK: Layout antigo/local (se o servidor nao mandou escpos_data)
         texto=_fmt(content,jt,pt)
         for _ in range(copies):
-            r=_imprimir_raw(nome,texto)
+            r=_imprimir_com_roteamento(imp, texto)
             if not r.get("ok"):
                 _stats["erros"] += 1
                 _stats["ultimo_erro"] = r.get("erro","")
-                reportar_erro_supabase(jid, nome, r.get("erro",""), jt)
                 ef_update_job(jid,"failed",r.get("erro","")); return
                 
     ef_update_job(jid,"printed",pa=time.strftime("%Y-%m-%dT%H:%M:%SZ",time.gmtime()))
-    log.info(f"[PRINT] Job {jid} OK em '{nome}'")
+    nome_imp = imp.get("nome_impressora") or imp.get("endereco_ip","")
+    log.info(f"[PRINT] Job {jid} OK em '{nome_imp}'")
     _stats["total_impressos"] += 1
     _stats["ultimo_job"] = time.strftime("%H:%M:%S")
-    _stats["ultima_impressora"] = nome
+    _stats["ultima_impressora"] = nome_imp
     # Contador diario - reseta meia-noite
     hoje = time.strftime("%d/%m/%Y")
     if _stats["hoje_data"] != hoje:
@@ -531,7 +576,7 @@ def proc_job(job):
     entrada = {
         "hora": time.strftime("%H:%M:%S"),
         "data": hoje,
-        "impressora": nome,
+        "impressora": nome_imp,
         "tipo": pt,
         "job_id": jid,
         "content_ref": content.get("order_number","") or content.get("order_id","")[:8] if content else ""
@@ -552,10 +597,51 @@ def poll():
     else: status_poll="Ativo - aguardando"
     _atualizar_icone()
 
+CURRENT_VERSION = "3.6"
+VERSION_URL = "https://raw.githubusercontent.com/delmatch-user/agente-local-releases/main/version.json"
+
+async def checar_atualizacao():
+    """Verifica nova versao silenciosamente e reinicia com a versao mais recente."""
+    if not getattr(sys, "frozen", False):
+        return  # Nao atualiza quando rodando como script
+    try:
+        req = urllib.request.Request(VERSION_URL, headers={"Cache-Control": "no-cache"})
+        with urllib.request.urlopen(req, timeout=10) as r:
+            info = json.loads(r.read())
+        nova = info.get("version", "")
+        url_nova = info.get("url", "")
+        if not nova or not url_nova or nova == CURRENT_VERSION:
+            return
+        log.info(f"[UPDATE] Nova versao {nova} disponivel. Baixando...")
+        exe_novo = BASE_DIR / f"AgenteLocal_{nova}.exe"
+        urllib.request.urlretrieve(url_nova, exe_novo)
+        log.info(f"[UPDATE] Download concluido: {exe_novo}")
+        # Script .bat substitui o exe atual e reinicia
+        bat = BASE_DIR / "update_apply.bat"
+        bat.write_text(
+            "@echo off\r\n"
+            "timeout /t 3 /nobreak >nul\r\n"
+            f'move /y "{exe_novo}" "{sys.executable}"\r\n'
+            f'start "" "{sys.executable}"\r\n'
+            'del "%~f0"\r\n',
+            encoding="utf-8"
+        )
+        subprocess.Popen(
+            ["cmd", "/c", str(bat)],
+            creationflags=subprocess.CREATE_NO_WINDOW
+        )
+        log.info("[UPDATE] Reiniciando para aplicar atualizacao...")
+        sys.exit(0)
+    except Exception as e:
+        log.debug(f"[UPDATE] {e}")
+
 async def loop_poll():
     iv=int(cfg.get("poll_interval",3))
     log.info(f"[POLL] Iniciando a cada {iv}s")
     ciclos = 0
+    ultimo_update_check = 0
+    # Verifica atualizacao logo no inicio
+    await checar_atualizacao()
     while True:
         try: poll()
         except Exception as e: log.error(f"[POLL] {e}")
@@ -564,6 +650,12 @@ async def loop_poll():
         if ciclos % max(1, int(300 / max(iv,1))) == 0:
             try: sincronizar_impressoras()
             except Exception as e: log.error(f"[SYNC] {e}")
+        # Verifica atualizacao a cada hora
+        agora = time.time()
+        if agora - ultimo_update_check >= 3600:
+            ultimo_update_check = agora
+            try: await checar_atualizacao()
+            except Exception as e: log.debug(f"[UPDATE] {e}")
         await asyncio.sleep(iv)
 
 

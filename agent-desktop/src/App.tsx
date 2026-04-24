@@ -1,6 +1,8 @@
 import { useState, useEffect } from 'react'
 import { invoke } from '@tauri-apps/api/tauri'
 import { listen } from '@tauri-apps/api/event'
+import { checkUpdate, installUpdate } from '@tauri-apps/api/updater'
+import { relaunch } from '@tauri-apps/api/process'
 import Setup from './pages/Setup'
 import Status from './pages/Status'
 import Settings from './pages/Settings'
@@ -29,21 +31,34 @@ function App() {
 
   useEffect(() => {
     loadConfig()
-    
+    checkAndApplyUpdate()
+
     const unlistenSuccess = listen<string>('poll_success', (event) => {
       setIsOnline(true)
       setLastPoll(event.payload)
     })
-    
+
     const unlistenError = listen<string>('poll_error', () => {
       setIsOnline(false)
     })
-    
+
     return () => {
       unlistenSuccess.then(fn => fn())
       unlistenError.then(fn => fn())
     }
   }, [])
+
+  const checkAndApplyUpdate = async () => {
+    try {
+      const { shouldUpdate } = await checkUpdate()
+      if (shouldUpdate) {
+        await installUpdate()
+        await relaunch()
+      }
+    } catch {
+      // Silencioso — falha de update nao bloqueia o app
+    }
+  }
 
   const loadConfig = async () => {
     try {
