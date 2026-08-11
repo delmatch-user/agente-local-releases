@@ -32,6 +32,7 @@ pub struct ReceiptItem {
     pub total_cents: i64,
     pub notes: Option<String>,
     pub addons: Vec<String>,
+    pub barcode: Option<String>,
 }
 
 pub struct ReceiptFormatter {
@@ -139,7 +140,15 @@ impl ReceiptFormatter {
             bytes.extend(std::iter::repeat(b' ').take(padding));
             bytes.extend(print_text(&price_str));
             bytes.extend(line_feed());
-            
+
+            // Código do produto (barcode/EAN), quando cadastrado
+            if let Some(ref barcode) = item.barcode {
+                if !barcode.is_empty() {
+                    bytes.extend(print_text(&format!("  Cod: {}", barcode)));
+                    bytes.extend(line_feed());
+                }
+            }
+
             // Addons
             for addon in &item.addons {
                 bytes.extend(print_text(&format!("  + {}", addon)));
