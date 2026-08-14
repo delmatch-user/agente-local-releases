@@ -13,12 +13,20 @@ VERSION     = "1.0.0"
 BASE = [
     sys.executable, "-m", "PyInstaller",
     "--name", APP_NAME, "--noconfirm", "--clean", "--log-level", "WARN",
+    # Pasta persistente em vez de %TEMP%/_MEI*: antivirus/limpador apagando o Temp em
+    # runtime derruba o exe onefile ("base_library.zip not found" / abre e fecha sozinho).
+    # A v5.76 saiu SEM isto (este build.py regenerou o spec e perdeu a linha) e quebrou
+    # em cliente real. NUNCA remova este flag de um build de release.
+    "--runtime-tmpdir", "%LOCALAPPDATA%/AgenteLocalMIA/runtime",
     "--hidden-import", "win32api",
     "--hidden-import", "win32print",
     "--hidden-import", "serial.tools.list_ports",
     "--hidden-import", "websockets",
     "--hidden-import", "pynput",
     "--hidden-import", "usb",
+    "--hidden-import", "pystray",
+    "--hidden-import", "PIL.Image",
+    "--hidden-import", "PIL.ImageDraw",
 ]
 if Path(ICON).exists():
     BASE += ["--icon", ICON]
@@ -33,7 +41,8 @@ def run(cmd, label):
     print("[OK] " + label)
 
 def build_portatil():
-    run(BASE + ["--onefile", "--console", MAIN_SCRIPT], "PyInstaller -> onefile (portatil)")
+    # --windowed SEMPRE no release: build console reabre o "CMD piscando" (corrigido na v5.73)
+    run(BASE + ["--onefile", "--windowed", MAIN_SCRIPT], "PyInstaller -> onefile (portatil)")
     src  = Path("dist") / (APP_NAME + ".exe")
     dest = APP_NAME + "_portatil_" + VERSION + ".exe"
     if src.exists():
